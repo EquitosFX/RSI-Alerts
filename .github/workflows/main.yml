@@ -37,6 +37,10 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Optional. Leave the secret unset (or empty) to run Yahoo-only,
+          # exactly as before - FMP_API_KEY just enables the volume-patch /
+          # fallback / cross-check described in rsi_alerts.py's CONFIG section.
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
         run: python rsi_alerts.py ${{ inputs.test_message && '--test-message' || '' }}
 
       - name: Save alert state
