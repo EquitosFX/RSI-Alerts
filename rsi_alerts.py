@@ -60,19 +60,29 @@ RSI_LENGTH = 14
 # symbol       : Yahoo ticker. Forex = PAIR=X. Gold = XAUUSD=X (or GC=F futures)
 # timeframes   : any of 5m 15m 30m 1h 1d 1wk
 # above/below  : alert when RSI CROSSES these levels. None = ignore that side.
+TIMEFRAMES = ["1h", "4h", "1d"]
+
 WATCHLIST = [
-    {"name": "XAUUSD",  "symbol": "XAUUSD=X", "timeframes": ["1h", "1d"],        "above": 10, "below": 30},
-    {"name": "EURUSD",  "symbol": "EURUSD=X", "timeframes": ["1h", "1d"],        "above": 70, "below": 30},
-    {"name": "GBPUSD",  "symbol": "GBPUSD=X", "timeframes": ["1h", "1d"],        "above": 70, "below": 30},
-    {"name": "USDJPY",  "symbol": "USDJPY=X", "timeframes": ["1h", "1d"],        "above": 70, "below": 30},
-    {"name": "AUDUSD",  "symbol": "AUDUSD=X", "timeframes": ["1d"],              "above": 70, "below": 30},
-    {"name": "DXY",     "symbol": "DX-Y.NYB", "timeframes": ["1d"],              "above": 70, "below": 30},
+    {"name": "XAUUSD",  "symbol": "XAUUSD=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
+    {"name": "EURUSD",  "symbol": "EURUSD=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
+    {"name": "GBPUSD",  "symbol": "GBPUSD=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
+    {"name": "USDJPY",  "symbol": "USDJPY=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
+    {"name": "AUDUSD",  "symbol": "AUDUSD=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
+    {"name": "DXY",     "symbol": "DX-Y.NYB", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
 ]
 
 STATE_FILE = "rsi_alert_state.json"
 
 # Yahoo caps how far back intraday data goes
-PERIOD_FOR = {"5m": "5d", "15m": "1mo", "30m": "1mo", "1h": "3mo", "1d": "2y", "1wk": "5y"}
+PERIOD_FOR = {"5m": "5d", "15m": "1mo", "30m": "1mo", "1h": "6mo", "1d": "2y", "1wk": "5y"}
+
+# Yahoo has NO 4h interval. These are built by resampling a lower one.
+# 4h bars are aligned to 00:00 UTC (00/04/08/12/16/20). Your broker may align
+# its 4h bars to its own server time instead — usually 17:00 New York — so the
+# candles will not always match what you see on the chart. RSI on a 4h series
+# offset by an hour or two is close but not identical. Worth knowing before you
+# wonder why a level fired here and not there.
+RESAMPLE_FROM = {"2h": ("1h", "2h"), "4h": ("1h", "4h"), "8h": ("1h", "8h")}
 
 # ==========================================================================
 
@@ -124,16 +134,29 @@ def send_telegram(text: str, dry: bool = False) -> bool:
 
 
 def fetch(symbol: str, interval: str) -> pd.DataFrame | None:
+    """Download bars. Timeframes Yahoo doesn't offer are resampled from a lower one."""
     if yf is None:
         print("  !! yfinance not installed  (pip install yfinance)")
         return None
+
+    base, rule = RESAMPLE_FROM.get(interval, (interval, None))
+
     try:
-        df = yf.download(symbol, period=PERIOD_FOR.get(interval, "3mo"),
-                         interval=interval, progress=False, auto_adjust=False)
-        if df is None or df.empty or len(df) < RSI_LENGTH + 5:
+        df = yf.download(symbol, period=PERIOD_FOR.get(base, "6mo"),
+                         interval=base, progress=False, auto_adjust=False)
+        if df is None or df.empty:
             return None
         if isinstance(df.columns, pd.MultiIndex):      # yfinance sometimes returns these
             df.columns = df.columns.get_level_values(0)
+
+        if rule:
+            df = df.resample(rule, origin="epoch", label="left", closed="left").agg({
+                "Open": "first", "High": "max", "Low": "min",
+                "Close": "last", "Volume": "sum"}).dropna(subset=["Close"])
+
+        if len(df) < RSI_LENGTH + 5:
+            print(f"  !! only {len(df)} bars for {symbol} {interval} — need {RSI_LENGTH + 5}")
+            return None
         return df
     except Exception as e:
         print(f"  !! fetch failed {symbol} {interval}: {e}")
