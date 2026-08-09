@@ -2,8 +2,13 @@ name: RSI alerts
 
 on:
   schedule:
-    - cron: "0 * * * *"      # hourly. */15 works too but uses 4x the minutes.
+    - cron: "7 * * * *"      # hourly, offset off the hour to dodge GitHub congestion
   workflow_dispatch:
+    inputs:
+      test_message:
+        description: "Send a test Telegram message instead of checking RSI"
+        type: boolean
+        default: false
 
 jobs:
   check:
@@ -15,9 +20,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Restore the "already alerted" state from the previous run.
-      # Cache instead of a git commit: nothing gets pushed back to the repo,
-      # so a run can never collide with an edit made while it is running.
+      # State lives in the Actions cache, not a git commit, so a run can never
+      # collide with an edit made while it is running.
       - name: Restore alert state
         uses: actions/cache/restore@v4
         with:
@@ -33,7 +37,7 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python rsi_alerts.py
+        run: python rsi_alerts.py ${{ inputs.test_message && '--test-message' || '' }}
 
       - name: Save alert state
         if: always()
