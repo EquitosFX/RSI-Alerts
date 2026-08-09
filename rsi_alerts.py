@@ -63,7 +63,7 @@ RSI_LENGTH = 14
 TIMEFRAMES = ["1h", "4h", "1d"]
 
 WATCHLIST = [
-    {"name": "XAUUSD",  "symbol": "XAUUSD=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
+    {"name": "XAUUSD",  "symbol": "XAUUSD=X", "timeframes": TIMEFRAMES, "above": 10, "below": 30},
     {"name": "EURUSD",  "symbol": "EURUSD=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
     {"name": "GBPUSD",  "symbol": "GBPUSD=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
     {"name": "USDJPY",  "symbol": "USDJPY=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
