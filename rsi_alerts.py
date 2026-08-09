@@ -278,15 +278,4 @@ if __name__ == "__main__":
 #     steps:
 #       - uses: actions/checkout@v4
 #       - uses: actions/setup-python@v5
-#         with: {python-version: "3.11"}
-#       - run: pip install yfinance pandas requests
-#       - run: python rsi_alerts.py
-#         env:
-#           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
-#           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-#       - uses: stefanzweifel/git-auto-commit-action@v5   # persists the state file
-#         with: {commit_message: "state"}
-#
-# NOTE: GitHub's scheduler is best-effort and can run late under load. Fine
-# for 1h and 1d alerts; not suitable for 5m.
-# ==========================================================================
+#         with: {python-version
