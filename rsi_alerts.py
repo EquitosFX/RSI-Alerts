@@ -61,7 +61,7 @@ RSI_LENGTH = 14
 # timeframes   : any of 5m 15m 30m 1h 1d 1wk
 # above/below  : alert when RSI CROSSES these levels. None = ignore that side.
 WATCHLIST = [
-    {"name": "XAUUSD",  "symbol": "XAUUSD=X", "timeframes": ["1h", "1d"],        "above": 70, "below": 30},
+    {"name": "XAUUSD",  "symbol": "XAUUSD=X", "timeframes": ["1h", "1d"],        "above": 10, "below": 30},
     {"name": "EURUSD",  "symbol": "EURUSD=X", "timeframes": ["1h", "1d"],        "above": 70, "below": 30},
     {"name": "GBPUSD",  "symbol": "GBPUSD=X", "timeframes": ["1h", "1d"],        "above": 70, "below": 30},
     {"name": "USDJPY",  "symbol": "USDJPY=X", "timeframes": ["1h", "1d"],        "above": 70, "below": 30},
