@@ -62,8 +62,14 @@ RSI_LENGTH = 14
 # above/below  : alert when RSI CROSSES these levels. None = ignore that side.
 TIMEFRAMES = ["1h", "4h", "1d"]
 
+# NOTE ON GOLD: Yahoo does not serve "XAUUSD=X". Its gold instrument is GC=F,
+# the continuous front-month COMEX futures contract. It is not spot — it trades
+# a few dollars away from spot (the basis) and rolls between contract months.
+# For RSI that difference is immaterial: RSI reads the shape of the series, not
+# its level, and futures and spot move together almost tick for tick. But the
+# absolute price in the alert will not exactly match your broker's spot quote.
 WATCHLIST = [
-    {"name": "XAUUSD",  "symbol": "XAUUSD=X", "timeframes": TIMEFRAMES, "above": 10, "below": 30},
+    {"name": "GOLD",    "symbol": "GC=F",     "timeframes": TIMEFRAMES, "above": 10, "below": 30},
     {"name": "EURUSD",  "symbol": "EURUSD=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
     {"name": "GBPUSD",  "symbol": "GBPUSD=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
     {"name": "USDJPY",  "symbol": "USDJPY=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
