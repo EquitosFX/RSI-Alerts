@@ -51,6 +51,27 @@ except ImportError:
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "PUT_YOUR_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "PUT_YOUR_CHAT_ID_HERE")
 
+# ---- FMP backup / cross-check -------------------------------------------
+# Yahoo is and stays the primary source for everything - this is a safety
+# net, not a second opinion that overrides it. Two jobs, both scoped to the
+# daily timeframe only (where the whole indicator stack was validated):
+#   1. VOLUME PATCH - Yahoo's spot FX (=X) tickers routinely report 0 volume
+#      (forex is OTC, there's no consolidated tape). FMP's forex EOD data
+#      does carry real volume, confirmed live: non-zero, varies day to day,
+#      not a placeholder. When Yahoo's volume is unusable, FMP's fills in
+#      for quality_score()'s volume component.
+#   2. TRUE FALLBACK - if Yahoo returns nothing at all for a ticker on a
+#      run, FMP's full-history endpoint (no date bounds) returns years of
+#      OHLCV in one call - enough to recompute the entire RSI/ATR/Ichimoku/
+#      Stochastic stack from scratch, not just patch a single value.
+# Leave FMP_API_KEY blank to disable both - everything degrades to
+# Yahoo-only behaviour exactly as before, just without the volume/fallback.
+# Free FMP tier is 250 calls/day; caching the snapshot once per UTC day
+# (not once per hourly run) keeps this at ~1 call/pair/day regardless of
+# how often the workflow fires.
+FMP_API_KEY        = os.environ.get("FMP_API_KEY", "")
+FMP_PRICE_TOLERANCE = 0.0015   # flag (log only, never act on) gaps bigger than this
+
 RSI_LENGTH = 14
 TIMEFRAMES = ["1h", "4h", "1d"]
 
@@ -626,6 +647,90 @@ def send_telegram(text: str, dry: bool = False) -> bool:
         return False
 
 
+def fmp_symbol(ticker: str) -> str:
+    """Yahoo's 'EURUSD=X' -> FMP's 'EURUSD'. Scoped to true FX (=X) tickers -
+    metals (GC=F/SI=F) and DXY are futures/index tickers and already get
+    real volume from Yahoo, so they don't need this."""
+    return ticker[:-2] if ticker.endswith("=X") else None
+
+
+def fmp_get(symbol: str, from_date: str | None = None, to_date: str | None = None):
+    """Raw call to FMP's forex EOD endpoint. Returns a list of daily bars
+    (newest first) or None on any failure - callers must treat this as
+    optional and fall back to Yahoo-only behaviour, never raise."""
+    if not FMP_API_KEY:
+        return None
+    params = {"symbol": symbol, "apikey": FMP_API_KEY}
+    if from_date: params["from"] = from_date
+    if to_date:   params["to"] = to_date
+    try:
+        r = requests.get("https://financialmodelingprep.com/stable/historical-price-eod/full",
+                          params=params, timeout=20)
+        if r.status_code != 200:
+            return None
+        rows = r.json()
+        return rows if isinstance(rows, list) and rows else None
+    except Exception:
+        return None
+
+
+def fmp_daily_snapshot(state: dict, tickers: list[str]) -> dict:
+    """
+    Latest close + a short volume history per FX pair, refreshed once per
+    UTC calendar day and cached in the state file - NOT once per hourly
+    run, which would burn ~26 calls/hour (600+/day) against FMP's 250/day
+    free quota for data that only changes once a day. ~30 calendar days
+    (~20 trading days) is fetched so a 20-period volume average can be
+    built from FMP data alone on pairs where Yahoo's own volume series is
+    entirely zero, not just the latest bar.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if state.get("_fmp_date") == today and state.get("_fmp_cache"):
+        return state["_fmp_cache"]
+    cache = {}
+    since = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+    for tk in tickers:
+        sym = fmp_symbol(tk)
+        if not sym:
+            continue
+        rows = fmp_get(sym, from_date=since, to_date=today)
+        if rows:
+            try:
+                vols = [float(r.get("volume", 0) or 0) for r in rows[:21]]
+                cache[tk] = {"date": rows[0]["date"], "close": float(rows[0]["close"]),
+                             "volume": vols[0] if vols else 0.0,
+                             "vol_avg20": (sum(vols[1:21]) / len(vols[1:21])) if len(vols) > 1 else 0.0}
+            except Exception:
+                pass
+        time.sleep(0.25)   # gentle pacing, no published per-minute cap on the free tier
+    state["_fmp_cache"] = cache
+    state["_fmp_date"] = today
+    return cache
+
+
+def fmp_full_df(ticker: str):
+    """
+    TRUE fallback: full price history for one pair from FMP, reshaped to
+    look exactly like what fetch_batch() returns from Yahoo (Open/High/Low/
+    Close/Volume, ascending DatetimeIndex) so it can drop straight into the
+    same RSI/ATR/Ichimoku/Stochastic pipeline with no special-casing
+    downstream. Only called for a ticker Yahoo returned nothing for - not
+    cached, since this should be a rare event, not a routine path.
+    """
+    sym = fmp_symbol(ticker)
+    if not sym:
+        return None
+    rows = fmp_get(sym)
+    if not rows or len(rows) < RSI_LENGTH + 5:
+        return None
+    df = pd.DataFrame(rows)
+    df["dt"] = pd.to_datetime(df["date"])
+    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low",
+                             "close": "Close", "volume": "Volume"})
+    df = df[["dt", "Open", "High", "Low", "Close", "Volume"]].set_index("dt").sort_index()
+    return df
+
+
 def fetch_batch(tickers: list[str], interval: str) -> dict[str, pd.DataFrame]:
     """
     One request for ALL tickers on a timeframe instead of one each.
@@ -676,11 +781,21 @@ def check_all(dry: bool = False) -> int:
         data = fetch_batch(list(WATCHLIST.values()), tf)
         print(f"\n  --- {tf} ({len(data)}/{len(WATCHLIST)} fetched) ---")
 
+        # FMP snapshot: only meaningful on the daily timeframe (see CONFIG note).
+        fmp_cache = fmp_daily_snapshot(state, list(WATCHLIST.values())) \
+                    if (tf == "1d" and FMP_API_KEY) else {}
+
         for name, ticker in WATCHLIST.items():
             df = data.get(ticker)
+            used_fmp_fallback = False
             if df is None:
-                print(f"  {name}|{tf:<3}  no data")
-                continue
+                if tf == "1d" and FMP_API_KEY:
+                    df = fmp_full_df(ticker)
+                    used_fmp_fallback = df is not None
+                if df is None:
+                    print(f"  {name}|{tf:<3}  no data" + ("" if not FMP_API_KEY else " (yahoo+fmp)"))
+                    continue
+                print(f"  {name}|{tf:<3}  Yahoo had nothing - using FMP fallback")
 
             r = rsi_wilder(df["Close"], RSI_LENGTH).dropna()
             if len(r) < 3:
@@ -691,6 +806,16 @@ def check_all(dry: bool = False) -> int:
             curr, prev = float(r.iloc[-2]), float(r.iloc[-3])
             price = float(df["Close"].iloc[-2])
             bar_id = str(df.index[-2])
+
+            # Cross-check against FMP when both sources have a value, logged
+            # only (never acted on) - Yahoo stays the source of truth for
+            # every calculation above and below this line.
+            fmp_row = fmp_cache.get(ticker)
+            if fmp_row and not used_fmp_fallback:
+                gap = abs(price - fmp_row["close"]) / price if price else 0
+                if gap > FMP_PRICE_TOLERANCE:
+                    print(f"  {name}|{tf:<3}  !! price gap vs FMP: yahoo {price:.5f} "
+                          f"vs fmp {fmp_row['close']:.5f} ({gap*100:.2f}%)")
 
             # Regime context. Read on the same closed bar as the RSI value.
             try:
@@ -730,6 +855,13 @@ def check_all(dry: bool = False) -> int:
                 vol_avg20 = float(df["Volume"].rolling(20).mean().iloc[-2])
             except Exception:
                 vol_curr = vol_avg20 = float("nan")
+            # Yahoo's =X forex volume is frequently 0 for every bar, not just
+            # today's - patch both the current value AND the 20-period
+            # average from the FMP snapshot when Yahoo's own series is
+            # unusable, so the ratio quality_score() computes stays meaningful.
+            if (not vol_avg20 or np.isnan(vol_avg20) or vol_avg20 == 0) and fmp_row:
+                vol_curr = fmp_row["volume"]
+                vol_avg20 = fmp_row["vol_avg20"]
             weekday = df.index[-2].weekday()
             is_stacked = stack_tier in ("stacked", "full stack")
             qscore, qlabel = quality_score(adx_v, vol_curr, vol_avg20, weekday) if is_stacked else (0, "")
