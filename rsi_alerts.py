@@ -647,11 +647,29 @@ def send_telegram(text: str, dry: bool = False) -> bool:
         return False
 
 
+FMP_METALS = {"GC=F": "GCUSD", "SI=F": "SIUSD"}   # Yahoo futures ticker -> FMP commodity symbol
+
+
 def fmp_symbol(ticker: str) -> str:
-    """Yahoo's 'EURUSD=X' -> FMP's 'EURUSD'. Scoped to true FX (=X) tickers -
-    metals (GC=F/SI=F) and DXY are futures/index tickers and already get
-    real volume from Yahoo, so they don't need this."""
-    return ticker[:-2] if ticker.endswith("=X") else None
+    """
+    Yahoo's 'EURUSD=X' -> FMP's 'EURUSD', or Yahoo's 'GC=F'/'SI=F' -> FMP's
+    'GCUSD'/'SIUSD'. Gold and silver are included because they were part of
+    the same 28-instrument backtest that validated quality_score() and
+    entry_plan() - this isn't a new, untested instrument class, just the
+    same safety net extended to two pairs already in scope. Confirmed live
+    against FMP's commodities-historical-price-eod-full endpoint before
+    adding: real, non-zero, varying volume, same OHLCV field shape as forex.
+
+    Deliberately NOT extended to DXY, equity indices, Brent, or crypto, even
+    though this project's CSV data covers all of them - those were never
+    part of the tested stack. Widening the watchlist to new instrument
+    classes is a backtest decision, not an API-quota one; the 250-calls/day
+    headroom is not itself a reason to point the same untested logic at a
+    new market.
+    """
+    if ticker.endswith("=X"):
+        return ticker[:-2]
+    return FMP_METALS.get(ticker)
 
 
 def fmp_get(symbol: str, from_date: str | None = None, to_date: str | None = None):
