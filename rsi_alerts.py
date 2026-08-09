@@ -57,6 +57,10 @@ DIGEST_EVERY_HOURS = 4
 LOG_OUTCOMES = True
 OUTCOME_HORIZONS = [10, 20]        # trading days to score at
 OUTCOME_REPORT_EVERY_DAYS = 30     # send a summary this often
+
+# Append a short plain-English explainer to every alert. Turn off once the
+# wording is familiar and it becomes noise.
+SHOW_EXPLAINER = True
 DIGEST_ABOVE = 70          # what counts as "extended" for the digest
 DIGEST_BELOW = 30
 
@@ -328,6 +332,47 @@ def setup_grade(cloud_pos: str, thick_band: str, rsi_v: float, stoch_v: float) -
     return " + ".join(parts), tier, side
 
 
+def board_note(votes: int) -> str:
+    """
+    What the four-indicator board actually implies, which is the opposite of
+    what it looks like.
+
+    Measured across 17 FX pairs, daily, 10-day forward, excess over each pair's
+    own baseline. The BULLISH state of every one of these measured negative:
+
+        price > EMA50   -0.023pp     price < EMA50   +0.024pp
+        MACD > signal   -0.011pp     MACD < signal   +0.011pp
+        SAR below price +0.000pp     SAR above price -0.000pp
+        +DI > -DI       -0.041pp     -DI > +DI       +0.057pp   (with ADX>25)
+
+    So 4/4 up is the LEAST favourable reading on the board, not the most.
+    Roughly 35 standard indicators have now been tested on these pairs and the
+    result is the same every time: FX daily mean-reverts at this horizon.
+    """
+    if votes >= 4:
+        return ("all four trend reads bullish — on FX that has been the "
+                "<i>least</i> favourable state, not the most")
+    if votes == 3:
+        return "mostly bullish — historically a mild headwind on FX"
+    if votes == 2:
+        return "split — the board says nothing either way"
+    if votes == 1:
+        return "mostly bearish — historically the mildly favourable side on FX"
+    return ("all four trend reads bearish — historically the favourable "
+            "side on FX, which is why this is not a warning")
+
+
+def explainer() -> str:
+    """One short footer so the wording never has to be decoded from memory."""
+    return ("ℹ️ <i>“Leans” means a measured historical tendency, not advice. "
+            "Built from 17 FX pairs, 2010–2026: price stretched low inside a thick "
+            "cloud averaged +0.13% over 10 days on daily data — but only +0.05% on "
+            "held-out H4, and that was not significant. Trend indicators read "
+            "backwards on FX because these pairs mean-revert. Small effects, "
+            "never forward-tested. Treat every alert as a place to look, not a "
+            "reason to trade.</i>")
+
+
 def plain_read(side: int, tier: str, cloud_pos: str, band: str,
                rsi_v: float, stoch_v: float, adx_v: float, chop_v: float,
                direction: str) -> str:
@@ -506,6 +551,7 @@ def check_all(dry: bool = False) -> int:
             ctx = ("" if not tag else
                    f"{read}\n\n"
                    f"{dirline}\n"
+                   f"   ↳ <i>{board_note(votes)}</i>\n"
                    + (f"{cloud}\n" if cloud else "")
                    + (f"⚑ <b>{stack_label}</b> ({stack_tier}, "
                       f"{'long' if stack_side > 0 else 'short'} side)\n" if stack_label else "")
@@ -548,7 +594,8 @@ def check_all(dry: bool = False) -> int:
                        f"RSI now <b>{curr:.1f}</b> (was {prev:.1f})\n"
                        f"Price {price:,.4f}\n"
                        + (f"{ctx}\n" if ctx else "")
-                       + f"<i>{stamp} · closed bar · context, not confirmation</i>")
+                       + f"<i>{stamp} · closed bar</i>"
+                       + (f"\n\n{explainer()}" if SHOW_EXPLAINER else ""))
                 if send_telegram(msg, dry):
                     sent += 1
                     state[key] = bar_id
