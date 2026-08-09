@@ -110,9 +110,10 @@ METALS_AND_INDEX = {
 }
 
 # Edit this line to choose what runs. Merge whichever groups you want.
-WATCHLIST = {**MAJORS, **METALS_AND_INDEX}
-# WATCHLIST = {**MAJORS, **EUR_CROSSES, **GBP_CROSSES, **OTHER_CROSSES, **METALS_AND_INDEX}
-# WATCHLIST = {**MAJORS, **EUR_CROSSES, **GBP_CROSSES, **OTHER_CROSSES, **EXOTICS, **METALS_AND_INDEX}
+# Currently: the 28 standard FX pairs plus gold, silver and DXY = 31 instruments.
+WATCHLIST = {**MAJORS, **EUR_CROSSES, **GBP_CROSSES, **OTHER_CROSSES, **METALS_AND_INDEX}
+# WATCHLIST = {**MAJORS, **METALS_AND_INDEX}                                          # quieter: 10
+# WATCHLIST = {**MAJORS, **EUR_CROSSES, **GBP_CROSSES, **OTHER_CROSSES, **EXOTICS, **METALS_AND_INDEX}  # 41
 
 STATE_FILE = "rsi_alert_state.json"
 PERIOD_FOR = {"5m": "5d", "15m": "1mo", "30m": "1mo", "1h": "6mo", "1d": "2y", "1wk": "5y"}
@@ -349,6 +350,8 @@ def board_note(votes: int) -> str:
     Roughly 35 standard indicators have now been tested on these pairs and the
     result is the same every time: FX daily mean-reverts at this horizon.
     """
+    if votes < 0:
+        return ""                      # panel unavailable - say nothing rather than guess
     if votes >= 4:
         return ("all four trend reads bullish — on FX that has been the "
                 "<i>least</i> favourable state, not the most")
@@ -550,8 +553,8 @@ def check_all(dry: bool = False) -> int:
                               curr, stoch_v, adx_v, chop_v, "")
             ctx = ("" if not tag else
                    f"{read}\n\n"
-                   f"{dirline}\n"
-                   f"   ↳ <i>{board_note(votes)}</i>\n"
+                   + (f"{dirline}\n" if dirline else "")
+                   + (f"   ↳ <i>{board_note(votes)}</i>\n" if board_note(votes) else "")
                    + (f"{cloud}\n" if cloud else "")
                    + (f"⚑ <b>{stack_label}</b> ({stack_tier}, "
                       f"{'long' if stack_side > 0 else 'short'} side)\n" if stack_label else "")
