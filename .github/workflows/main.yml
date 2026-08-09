@@ -2,11 +2,8 @@ name: RSI alerts
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "0 * * * *"      # hourly. */15 works too but uses 4x the minutes.
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   check:
@@ -18,6 +15,17 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Restore the "already alerted" state from the previous run.
+      # Cache instead of a git commit: nothing gets pushed back to the repo,
+      # so a run can never collide with an edit made while it is running.
+      - name: Restore alert state
+        uses: actions/cache/restore@v4
+        with:
+          path: rsi_alert_state.json
+          key: rsi-state-${{ github.run_id }}
+          restore-keys: |
+            rsi-state-
+
       - name: Install dependencies
         run: pip install yfinance pandas requests
 
@@ -28,7 +36,8 @@ jobs:
         run: python rsi_alerts.py
 
       - name: Save alert state
-        uses: stefanzweifel/git-auto-commit-action@v5
+        if: always()
+        uses: actions/cache/save@v4
         with:
-          commit_message: "update alert state"
-          file_pattern: rsi_alert_state.json
+          key: rsi-state-${{ github.run_id }}
+          path: rsi_alert_state.json
