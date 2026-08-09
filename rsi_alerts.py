@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 """
 FOREX RSI ALERT MONITOR
 =======================
@@ -69,7 +69,7 @@ TIMEFRAMES = ["1h", "4h", "1d"]
 # its level, and futures and spot move together almost tick for tick. But the
 # absolute price in the alert will not exactly match your broker's spot quote.
 WATCHLIST = [
-    {"name": "GOLD",    "symbol": "GC=F",     "timeframes": TIMEFRAMES, "above": 10, "below": 30},
+    {"name": "GOLD",    "symbol": "GC=F",     "timeframes": TIMEFRAMES, "above": 70, "below": 30},
     {"name": "EURUSD",  "symbol": "EURUSD=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
     {"name": "GBPUSD",  "symbol": "GBPUSD=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
     {"name": "USDJPY",  "symbol": "USDJPY=X", "timeframes": TIMEFRAMES, "above": 70, "below": 30},
@@ -246,7 +246,28 @@ if __name__ == "__main__":
     ap.add_argument("--dry-run", action="store_true", help="print alerts instead of sending")
     ap.add_argument("--loop", type=int, metavar="SECONDS", help="run forever, checking every N seconds")
     ap.add_argument("--self-test", action="store_true", help="validate the RSI maths and exit")
+    ap.add_argument("--test-message", action="store_true",
+                    help="send one Telegram message immediately and exit — tests delivery only")
     a = ap.parse_args()
+
+    if a.test_message:
+        # Note: you CANNOT force an alert by setting a threshold to 10 or 99.
+        # Alerts fire on CROSSINGS — RSI must be on one side of the level on the
+        # previous bar and the other side now. A threshold RSI is permanently
+        # above or below is never crossed, so it never fires. Hence this flag.
+        tok, cid = TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+        print("Telegram configuration:")
+        print(f"  token   : {'MISSING' if 'PUT_YOUR' in tok else f'set, {len(tok)} chars, ends ...{tok[-4:]}'}")
+        print(f"  chat id : {'MISSING' if 'PUT_YOUR' in cid else f'set, value = {cid}'}")
+        if "PUT_YOUR" in tok or "PUT_YOUR" in cid:
+            print("\n  -> The secrets are not reaching the script.")
+            print("     In GitHub: Settings > Secrets and variables > Actions.")
+            print("     Names must be exactly TELEGRAM_TOKEN and TELEGRAM_CHAT_ID.")
+            sys.exit(1)
+        ok = send_telegram("✅ <b>Test message</b>\nYour RSI alert bot can reach you. "
+                           "Delivery is working — nothing else to fix here.")
+        print("\n  -> SENT. Check your phone." if ok else "\n  -> FAILED. See the error above.")
+        sys.exit(0 if ok else 1)
 
     if a.self_test:
         self_test()
@@ -278,4 +299,15 @@ if __name__ == "__main__":
 #     steps:
 #       - uses: actions/checkout@v4
 #       - uses: actions/setup-python@v5
-#         with: {python-version
+#         with: {python-version: "3.11"}
+#       - run: pip install yfinance pandas requests
+#       - run: python rsi_alerts.py
+#         env:
+#           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+#           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+#       - uses: stefanzweifel/git-auto-commit-action@v5   # persists the state file
+#         with: {commit_message: "state"}
+#
+# NOTE: GitHub's scheduler is best-effort and can run late under load. Fine
+# for 1h and 1d alerts; not suitable for 5m.
+# ==========================================================================
