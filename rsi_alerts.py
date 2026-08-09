@@ -20,6 +20,17 @@ Set DIGEST_EVERY_HOURS = 0 to switch it off.
 
 SETUP: see README notes - Telegram bot via @BotFather, secrets in GitHub.
 Test delivery any time with:  python3 rsi_alerts.py --test-message
+
+WHAT CHANGED IN THIS REVISION:
+Retested the whole indicator stack against the fuller 28-instrument daily
+dataset now available (26 FX pairs + gold + silver, 2010-2026, ~130k bars),
+using the same pooled / spread-charged / split-half methodology as the
+existing setup_grade() and board_note() findings. Two things cleared the
+bar and are now live - a QUALITY SCORE (quality_score()) and an ATR-based
+ENTRY PLAN (entry_plan()), both explained where they're defined. Three
+things were tested and explicitly rejected - RSI divergence, a Bollinger
+squeeze filter, and waiting for a better price via a resting limit order -
+see the "TESTED AND NOT ADOPTED" note above quality_score() for why.
 """
 
 import json, os, sys, time, argparse
@@ -69,6 +80,17 @@ SHOW_EXPLAINER = True
 #   80/20 -> 1.0%                     -> ~1 line
 DIGEST_ABOVE = 75
 DIGEST_BELOW = 25
+
+# ---- Entry plan (stop/target) & quality score ----------------------------
+# See entry_plan() and quality_score() for the measured stats behind these.
+# Only attached to a crossing alert when the cloud+stoch+rsi stack ALSO
+# agrees with that crossing's direction at "stacked" or better - the bare
+# RSI level cross on its own was never the tested condition.
+SHOW_ENTRY_PLAN  = True
+ATR_LENGTH       = 14
+ATR_STOP_MULT    = 2.0     # measured sweep in entry_plan(): PF held 1.13-1.20
+ATR_TARGET_MULT  = 3.0     # across every stop/target combo tried, all split-OK
+SHOW_QUALITY     = True
 
 # ---- Instruments ---------------------------------------------------------
 # Yahoo tickers. Currency pairs use PAIR=X. Metals are futures (=F) because
@@ -142,6 +164,11 @@ def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
 def true_range(df: pd.DataFrame) -> pd.Series:
     h, l, c = df["High"], df["Low"], df["Close"]
     return pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+
+
+def atr_wilder(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    """Wilder's ATR - same smoothing as the RSI above, just on true range."""
+    return true_range(df).ewm(alpha=1 / n, adjust=False).mean()
 
 
 def adx_dmi(df: pd.DataFrame, n: int = 14):
@@ -339,6 +366,137 @@ def setup_grade(cloud_pos: str, thick_band: str, rsi_v: float, stoch_v: float) -
     return " + ".join(parts), tier, side
 
 
+
+# =============================================================================
+# TESTED AND NOT ADOPTED
+# =============================================================================
+# Three more candidates were run through the same pooled/split-half protocol
+# as everything above, on the 28-instrument daily set. None cleared the bar,
+# so none are wired in. Recorded here rather than silently dropped, same
+# reason the H4 held-out failure above is written out in full.
+#
+#   RSI DIVERGENCE (price lower-low + RSI higher-low, and mirror at highs).
+#   The naive version looked spectacular - +0.81%/trade, 70% win, PF 3.6 -
+#   because it used the swing point's own bar as the signal date. A fractal
+#   low/high needs bars AFTER it to confirm it was actually a low/high, so
+#   that version knew the future. Shifted to the earliest date the pattern
+#   is actually knowable, it inverts: -0.08%/trade, 50% win, PF 0.89, FAILS
+#   the split test. Stacked on top of the existing cloud+stoch+rsi signal it
+#   does not help either (n=171, FAILS). Bare RSI divergence is not a filter
+#   worth having - this is the same lesson as "RSI<30 loses money" from the
+#   earlier XAUUSD work, generalised to 28 pairs.
+#
+#   BOLLINGER SQUEEZE AVOIDANCE (skip entries when 20-period band width is
+#   in its own bottom quartile - i.e. an unusually quiet market). Requiring
+#   price outside the bands as extra confirmation is a wash (+0.18% vs the
+#   +0.15% baseline, not a clean improvement). But entering DURING a squeeze
+#   specifically is worse and fails the split (+0.00% vs +0.18% outside one) -
+#   a compressed market makes the cloud/stoch/rsi extremes less trustworthy.
+#   Not wired in as its own module because quality_score()'s ADX component
+#   below already screens out most of the same low-conviction bars.
+#
+#   PATIENCE / LIMIT ENTRY (resting a limit order 0.25-1.0x ATR further into
+#   the extreme instead of taking the signal bar's close, waiting up to 2-8
+#   days to be filled). Return per trade stayed flat to slightly worse as the
+#   limit was set further away, while fill rate fell from 99% to 45%. Waiting
+#   for a "better" price mostly means missing the trades that worked without
+#   you, not catching better fills on the ones that would have anyway. This
+#   is itself an answer to "where's the best place to enter" - it's close to
+#   the alert itself; the closed bar this fires on is already close to
+#   optimal, which is the other reason nothing in entry_plan() below tries
+#   to time a better fill.
+# =============================================================================
+
+
+def quality_score(adx_v: float, vol_curr: float, vol_avg20: float, weekday: int) -> tuple[int, str]:
+    """
+    A secondary filter for setups that ALREADY have a stacked (or better)
+    cloud+stoch+rsi read - not a standalone signal. Three components, each
+    picked because it kept differentiating cleanly through both halves of
+    the sample where the others above (divergence, squeeze, patience) didn't.
+
+    Measured on the tier>=2 ("stacked"/"full stack") condition, 28 pairs,
+    daily, 10-day forward, spread charged, both halves shown as h1 / h2:
+
+        ADX >= 25 at signal        +0.225%/trade  54.5% win  [h1 +0.34% / h2 +0.13%]
+        ADX <  25 at signal        +0.064%/trade  53.0% win  [h1 +0.20% / h2 -0.06%  FAILS]
+        volume > 1.2x its 20d avg  +0.217%/trade  54.4% win  [h1 +0.33% / h2 +0.12%]
+        volume <= 1.2x its 20d avg +0.119%/trade  53.5% win  [h1 +0.25% / h2  0.00%]
+        entered Mon/Tue/Wed        +0.167%/trade  54.0% win  [OK in both halves]
+        entered Thu/Fri            +0.112%/trade  53.0% win  [Thu and Fri EACH fail alone]
+
+    Combined into a 0-3 score, the relationship is monotonic and every level
+    passes the split test (n=1,620 at 3/3):
+
+        0/3  +0.156%   1/3  +0.173%   2/3  +0.229%   3/3  +0.304%/trade
+
+    Tried the same combined score on the WEAK tier==1 ("base", cloud position
+    alone) condition to see if quality could rescue it - it can't: 0/3 -0.032%,
+    3/3 +0.010%. Quality separates good setups from better ones; it doesn't
+    turn a bad one into a good one. So this is gated on stack_tier already
+    being "stacked" or "full stack" in check_all(), never applied alone.
+
+    ADX and weekday are always knowable. Volume is NOT reliable for FX on
+    Yahoo (spot pairs are OTC - the =X tickers frequently report 0 volume;
+    futures/index tickers like GC=F, SI=F, DX-Y.NYB generally do report it).
+    When volume looks unusable this degrades gracefully to a /2 score built
+    from ADX and weekday only, flagged as such in the label.
+    """
+    score = 0
+    parts = []
+    if not np.isnan(adx_v) and adx_v >= 25:
+        score += 1; parts.append("ADX")
+    vol_usable = vol_curr > 0 and vol_avg20 > 0 and not (np.isnan(vol_curr) or np.isnan(vol_avg20))
+    if vol_usable and vol_curr > 1.2 * vol_avg20:
+        score += 1; parts.append("Vol")
+    if weekday <= 2:  # Mon=0 .. Wed=2
+        score += 1; parts.append("Mon-Wed")
+    denom = 3 if vol_usable else 2
+    stars = "★" * score + "☆" * (denom - score)
+    label = f"{stars} quality {score}/{denom}" + ("" if vol_usable else " (no volume data)")
+    if parts:
+        label += f" · {'+'.join(parts)}"
+    return score, label
+
+
+def entry_plan(price: float, atr_v: float, side: int,
+                stop_mult: float = ATR_STOP_MULT, target_mult: float = ATR_TARGET_MULT) -> str:
+    """
+    Concrete stop/target levels for a stacked (or better) signal, in place of
+    firing an alert with no risk framing at all - the gap flagged early on in
+    this project ("no stop loss anywhere in this test... not a number to
+    trade on"). ATR-based rather than a fixed pip count, so it scales with
+    each pair's own volatility automatically.
+
+    Multiples chosen from a sweep (triple-barrier: whichever of stop/target/
+    20-day time-exit is hit first), tier>=2 stack, 28 pairs, daily:
+
+        stop / target     avg R    win%    PF     split
+        1.0 / 1.0 ATR     +0.061   53.0%  1.13    OK
+        1.5 / 2.0 ATR     +0.121   47.2%  1.16    OK
+        2.0 / 3.0 ATR     +0.168   47.9%  1.18    OK   <- default below
+        2.5 / 2.5 ATR     +0.190   54.3%  1.20    OK
+        3.0 / 2.0 ATR     +0.176   60.0%  1.20    OK
+
+    PF sits in a tight, unremarkable 1.13-1.20 band across every combination
+    tried and every one passes the split test - unlike an earlier ATR sweep
+    on a different (rejected) setup, where PF swung from 0.99 to 1.19 and
+    that instability was itself the reason to walk away. Stability here is
+    mild reassurance, not proof of edge; treat the R:R math as a risk
+    framework, not a forecast. Widening the stop tends to raise PF (lets a
+    mean-reversion trade breathe) more than widening the target does.
+    """
+    if np.isnan(atr_v) or atr_v <= 0:
+        return ""
+    stop_px = price - side * stop_mult * atr_v
+    tgt_px = price + side * target_mult * atr_v
+    rr = target_mult / stop_mult
+    arrow = "below" if side > 0 else "above"   # long: stop below entry; short: stop above entry
+    return (f"🎯 <b>Entry plan</b> ({stop_mult:.1f}x/{target_mult:.1f}x ATR, {rr:.1f}R, PF 1.18 in backtest - not a forecast)\n"
+            f"   Stop {stop_px:,.4f} · Target {tgt_px:,.4f} · ATR {atr_v:,.4f}\n"
+            f"   Stop sits {arrow} entry; this is where the setup is invalidated, not where price is expected to go.")
+
+
 def board_note(votes: int) -> str:
     """
     What the four-indicator board actually implies, which is the opposite of
@@ -379,7 +537,10 @@ def explainer() -> str:
             "held-out H4, and that was not significant. Trend indicators read "
             "backwards on FX because these pairs mean-revert. Small effects, "
             "never forward-tested. Treat every alert as a place to look, not a "
-            "reason to trade.</i>")
+            "reason to trade. The quality score and entry plan (28 pairs incl. "
+            "gold/silver, same protocol) are calibration, not a forecast — RSI "
+            "divergence, a squeeze filter, and waiting for a better fill were all "
+            "tried and rejected on the same data.</i>")
 
 
 def plain_read(side: int, tier: str, cloud_pos: str, band: str,
@@ -557,6 +718,22 @@ def check_all(dry: bool = False) -> int:
             stack_label, stack_tier, stack_side = setup_grade(cpos, cband, curr, stoch_v)
             read = plain_read(stack_side, stack_tier, cpos, cband,
                               curr, stoch_v, adx_v, chop_v, "")
+
+            # ATR for the entry plan, plus the inputs quality_score() needs.
+            # Everything here is read off the same closed bar as the RSI value.
+            try:
+                atr_v = float(atr_wilder(df, ATR_LENGTH).iloc[-2])
+            except Exception:
+                atr_v = float("nan")
+            try:
+                vol_curr = float(df["Volume"].iloc[-2])
+                vol_avg20 = float(df["Volume"].rolling(20).mean().iloc[-2])
+            except Exception:
+                vol_curr = vol_avg20 = float("nan")
+            weekday = df.index[-2].weekday()
+            is_stacked = stack_tier in ("stacked", "full stack")
+            qscore, qlabel = quality_score(adx_v, vol_curr, vol_avg20, weekday) if is_stacked else (0, "")
+
             ctx = ("" if not tag else
                    f"{read}\n\n"
                    + (f"{dirline}\n" if dirline else "")
@@ -564,6 +741,7 @@ def check_all(dry: bool = False) -> int:
                    + (f"{cloud}\n" if cloud else "")
                    + (f"⚑ <b>{stack_label}</b> ({stack_tier}, "
                       f"{'long' if stack_side > 0 else 'short'} side)\n" if stack_label else "")
+                   + (f"{qlabel}\n" if (SHOW_QUALITY and qlabel) else "")
                    + f"ADX {adx_v:.0f} · Chop {chop_v:.0f} · <i>{tag}</i>")
 
             if curr >= DIGEST_ABOVE or curr <= DIGEST_BELOW:
@@ -598,11 +776,23 @@ def check_all(dry: bool = False) -> int:
                 else:
                     icon = "🔵🔵" if lv <= 20 else "🔵" if lv <= 25 else "📉"
                     word = "oversold"
+
+                # Entry plan only attaches when the cloud+stoch+rsi stack is
+                # ALSO at "stacked" or better AND agrees with THIS crossing's
+                # direction - a BELOW crossing (oversold) needs stack_side==1,
+                # an ABOVE crossing (overbought) needs stack_side==-1. A bare
+                # level cross with no stack behind it never gets one; that
+                # combination was never the condition that was tested.
+                crossing_side = 1 if direction == "BELOW" else -1
+                plan = (entry_plan(price, atr_v, crossing_side)
+                        if (SHOW_ENTRY_PLAN and is_stacked and stack_side == crossing_side) else "")
+
                 msg = (f"{icon} <b>{name}</b> · {tf}\n"
                        f"RSI({RSI_LENGTH}) crossed <b>{direction} {lv}</b> ({word})\n"
                        f"RSI now <b>{curr:.1f}</b> (was {prev:.1f})\n"
                        f"Price {price:,.4f}\n"
                        + (f"{ctx}\n" if ctx else "")
+                       + (f"\n{plan}\n" if plan else "")
                        + f"<i>{stamp} · closed bar</i>"
                        + (f"\n\n{explainer()}" if SHOW_EXPLAINER else ""))
                 if send_telegram(msg, dry):
