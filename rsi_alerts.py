@@ -20,20 +20,9 @@ Set DIGEST_EVERY_HOURS = 0 to switch it off.
 
 SETUP: see README notes - Telegram bot via @BotFather, secrets in GitHub.
 Test delivery any time with:  python3 rsi_alerts.py --test-message
-
-WHAT CHANGED IN THIS REVISION:
-Retested the whole indicator stack against the fuller 28-instrument daily
-dataset now available (26 FX pairs + gold + silver, 2010-2026, ~130k bars),
-using the same pooled / spread-charged / split-half methodology as the
-existing setup_grade() and board_note() findings. Two things cleared the
-bar and are now live - a QUALITY SCORE (quality_score()) and an ATR-based
-ENTRY PLAN (entry_plan()), both explained where they're defined. Three
-things were tested and explicitly rejected - RSI divergence, a Bollinger
-squeeze filter, and waiting for a better price via a resting limit order -
-see the "TESTED AND NOT ADOPTED" note above quality_score() for why.
 """
 
-import json, os, re, sys, time, argparse
+import json, os, sys, time, argparse
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
@@ -50,27 +39,6 @@ except ImportError:
 # ==========================================================================
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "PUT_YOUR_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "PUT_YOUR_CHAT_ID_HERE")
-
-# ---- FMP backup / cross-check -------------------------------------------
-# Yahoo is and stays the primary source for everything - this is a safety
-# net, not a second opinion that overrides it. Two jobs, both scoped to the
-# daily timeframe only (where the whole indicator stack was validated):
-#   1. VOLUME PATCH - Yahoo's spot FX (=X) tickers routinely report 0 volume
-#      (forex is OTC, there's no consolidated tape). FMP's forex EOD data
-#      does carry real volume, confirmed live: non-zero, varies day to day,
-#      not a placeholder. When Yahoo's volume is unusable, FMP's fills in
-#      for quality_score()'s volume component.
-#   2. TRUE FALLBACK - if Yahoo returns nothing at all for a ticker on a
-#      run, FMP's full-history endpoint (no date bounds) returns years of
-#      OHLCV in one call - enough to recompute the entire RSI/ATR/Ichimoku/
-#      Stochastic stack from scratch, not just patch a single value.
-# Leave FMP_API_KEY blank to disable both - everything degrades to
-# Yahoo-only behaviour exactly as before, just without the volume/fallback.
-# Free FMP tier is 250 calls/day; caching the snapshot once per UTC day
-# (not once per hourly run) keeps this at ~1 call/pair/day regardless of
-# how often the workflow fires.
-FMP_API_KEY        = os.environ.get("FMP_API_KEY", "")
-FMP_PRICE_TOLERANCE = 0.0015   # flag (log only, never act on) gaps bigger than this
 
 RSI_LENGTH = 14
 TIMEFRAMES = ["1h", "4h", "1d"]
@@ -90,9 +58,10 @@ LOG_OUTCOMES = True
 OUTCOME_HORIZONS = [10, 20]        # trading days to score at
 OUTCOME_REPORT_EVERY_DAYS = 30     # send a summary this often
 
-# Append a short plain-English explainer to every alert. Turn off once the
-# wording is familiar and it becomes noise.
-SHOW_EXPLAINER = True
+# Append a short plain-English explainer to every alert. Off by default now
+# that the wording ("leans") is familiar - flip back to True any time you
+# want it back, e.g. after adding a new pair/instrument to the watchlist.
+SHOW_EXPLAINER = False
 # What counts as "extended" for the DIGEST only. Crossing alerts are unaffected
 # by these - those use LEVELS_ABOVE / LEVELS_BELOW above.
 # Measured on 85,255 daily RSI readings across 17 pairs:
@@ -102,16 +71,75 @@ SHOW_EXPLAINER = True
 DIGEST_ABOVE = 75
 DIGEST_BELOW = 25
 
-# ---- Entry plan (stop/target) & quality score ----------------------------
-# See entry_plan() and quality_score() for the measured stats behind these.
-# Only attached to a crossing alert when the cloud+stoch+rsi stack ALSO
-# agrees with that crossing's direction at "stacked" or better - the bare
-# RSI level cross on its own was never the tested condition.
-SHOW_ENTRY_PLAN  = True
-ATR_LENGTH       = 14
-ATR_STOP_MULT    = 2.0     # measured sweep in entry_plan(): PF held 1.13-1.20
-ATR_TARGET_MULT  = 3.0     # across every stop/target combo tried, all split-OK
-SHOW_QUALITY     = True
+# ---- Layer 7/8: portfolio exposure & position sizing ---------------------
+# Layer 7: currency-level and pairwise-correlation exposure warnings across
+# whatever is flagged THIS run. Layer 8: fractional-Kelly position sizing
+# computed from the bot's OWN live _tally data above (never from a backtest
+# figure - only forward-tested numbers reflect what has actually happened
+# since deployment). Both are printed as CONTEXT, same philosophy as
+# regime_tag(): never a hard gate on whether an alert fires, because this
+# project already found hard-gating the RSI signal on a second indicator
+# made results worse, not better.
+ACCOUNT_EQUITY        = float(os.environ.get("ACCOUNT_EQUITY") or "10000")  # for $ sizing only
+MAX_NET_CCY_EXPOSURE  = 2.0     # net same-direction stacked setups on one currency before warning
+CORR_WINDOW           = 20      # bars for the rolling correlation check
+CORR_THRESHOLD        = 0.75    # |rho| above this between two ACTIVE setups gets flagged
+ATR_STOP_MULT         = 2.0     # stop distance used for sizing, in ATR multiples
+KELLY_FRACTION        = 0.5     # half-Kelly - full Kelly is well-documented as too aggressive
+                                 # given real-world estimation error on a live sample
+MAX_RISK_PCT          = 0.02    # hard cap regardless of what Kelly says
+MIN_TRADES_FOR_KELLY  = 50      # below this the tally is noise, not edge - see kelly_from_tally()
+DEFAULT_RISK_PCT      = 0.005   # fixed, conservative fallback while the sample builds
+
+# ---- Extra context: z-score / HV percentile -------------------------------
+# Phase 1 survey candidates (z-score mean reversion, historical-volatility
+# percentile) - pure OHLC, nothing new to fetch. UNVALIDATED on this project;
+# shown as one extra compact context line, same footing as ADX/Chop.
+ZSCORE_WINDOW  = 20
+HV_WINDOW      = 20
+HV_LOOKBACK    = 100
+
+# ---- Z-score / Keltner reversion alerts (Phase 2 validated, daily-only) --
+# Both cleared the project's pooled/spread-charged/split-half protocol on
+# daily with a 20-trading-day hold:
+#   Z-score |z|>=2   PF 1.15  n=7,732  t=4.13  both halves PF 1.16/1.14
+#   Keltner reversion PF 1.14  n=5,844  t=3.32  both halves PF 1.13/1.16
+# NEITHER cleared the held-out H4 check (excess over baseline ~0 there:
+# z-score -0.013%, Keltner -0.001%) - so these fire on 1d ONLY, never 1h/4h.
+# They also do NOT stack with each other - tested WORSE combined (avg
+# +0.111%, PF 1.11) than either alone, because both measure essentially the
+# same thing (distance from mean in vol-adjusted units). Kept as two
+# separate, independently-tallied alert types - never OR'd or AND'd, and
+# deliberately NOT folded into stack_tier/quality_score above, which stay
+# scoped to the cloud+Stoch+RSI combination they were validated on.
+ZREV_THRESH          = 2.0    # |z| >= this triggers a reversion entry
+KELTNER_WINDOW        = 20
+KELTNER_MULT          = 2.0
+REVERSION_HORIZON_DAYS = 20   # the only horizon that cleared Phase 2 for these
+
+# ---- COT (Commitments of Traders) overlay ---------------------------------
+# CFTC Legacy Futures-Only report, free, Socrata Open Data API, no key
+# required. Weekly cadence (Tuesday positions, released the following
+# Friday ~3:30pm ET) - cached so the bot doesn't hit it every hourly run
+# for data that only changes once a week. UNVALIDATED as a signal here;
+# shown as one context line, same footing as everything above.
+COT_URL = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
+# WATCHLIST name -> distinguishing substring of the CFTC contract name,
+# matched with SoQL LIKE (so exact CFTC spacing/capitalization doesn't need
+# to be exact - only present in market_and_exchange_names).
+COT_CONTRACTS = {
+    "EURUSD": "EURO FX",
+    "GBPUSD": "BRITISH POUND",
+    "USDJPY": "JAPANESE YEN",       # net-long yen speculators = USDJPY headwind
+    "USDCHF": "SWISS FRANC",
+    "USDCAD": "CANADIAN DOLLAR",
+    "AUDUSD": "AUSTRALIAN DOLLAR",
+    "NZDUSD": "NZ DOLLAR",
+    "GOLD":   "GOLD",
+    "SILVER": "SILVER",
+}
+COT_CACHE_DAYS = 3   # the underlying data only updates weekly - no reason
+                      # to re-fetch more often than this
 
 # ---- Instruments ---------------------------------------------------------
 # Yahoo tickers. Currency pairs use PAIR=X. Metals are futures (=F) because
@@ -187,8 +215,10 @@ def true_range(df: pd.DataFrame) -> pd.Series:
     return pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
 
 
-def atr_wilder(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    """Wilder's ATR - same smoothing as the RSI above, just on true range."""
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    """Wilder-smoothed ATR in price units. adx_dmi() computes the same thing
+    inline for its own normalization; kept as its own function too because
+    Layer 8 sizing below needs an ATR value directly."""
     return true_range(df).ewm(alpha=1 / n, adjust=False).mean()
 
 
@@ -211,6 +241,53 @@ def choppiness(df: pd.DataFrame, n: int = 14) -> pd.Series:
     tr_sum = true_range(df).rolling(n).sum()
     rng = df["High"].rolling(n).max() - df["Low"].rolling(n).min()
     return 100 * np.log10(tr_sum / rng) / np.log10(n)
+
+
+def zscore(close: pd.Series, window: int = ZSCORE_WINDOW) -> pd.Series:
+    """
+    Rolling z-score: (price - rolling mean) / rolling std. A continuous
+    mean-reversion read in the same conceptual family as RSI, but not
+    bounded 0-100 - large |z| means price is stretched relative to its own
+    recent range in raw standard-deviation terms.
+
+    Phase 1 survey candidate - UNVALIDATED on this project. Shown as one
+    extra context line, same footing as ADX/Chop: never a signal or a gate
+    on its own.
+    """
+    m = close.rolling(window).mean()
+    s = close.rolling(window).std()
+    return (close - m) / s
+
+
+def hv_percentile(close: pd.Series, window: int = HV_WINDOW,
+                   lookback: int = HV_LOOKBACK) -> pd.Series:
+    """
+    Where today's realized volatility (annualized stdev of log returns over
+    `window` bars) ranks against its own trailing `lookback` history, 0-100.
+    High = volatility itself is stretched, regardless of direction - a
+    different read than ADX/Choppiness, which measure trend strength and
+    directional persistence rather than the magnitude of movement.
+
+    Phase 1 survey candidate - UNVALIDATED on this project. Context only.
+    """
+    log_ret = np.log(close).diff()
+    real_vol = log_ret.rolling(window).std() * np.sqrt(252)
+    return real_vol.rolling(lookback).rank(pct=True) * 100
+
+
+def keltner(df: pd.DataFrame, window: int = KELTNER_WINDOW, mult: float = KELTNER_MULT):
+    """
+    Keltner Channels: EMA(window) +/- mult*ATR(window).
+
+    Phase 2 VALIDATED as a daily mean-reversion signal (PF 1.14, n=5,844,
+    both split-halves consistent) - did NOT clear the held-out H4 check
+    (excess over baseline ~0 there). See REVERSION_HORIZON_DAYS in CONFIG
+    and the alert-firing block in check_all() for the entry logic (close
+    crossing back inside the bands after being outside them).
+    """
+    ema = df["Close"].ewm(span=window, adjust=False).mean()
+    a = atr(df, window)
+    return ema + mult * a, ema - mult * a
 
 
 def parabolic_sar(df: pd.DataFrame, af0=0.02, step=0.02, afmax=0.2):
@@ -373,13 +450,13 @@ def setup_grade(cloud_pos: str, thick_band: str, rsi_v: float, stoch_v: float) -
         return "", "", 0
     if cloud_pos == "below":
         parts = ["below thick cloud"]
-        if not np.isnan(stoch_v) and stoch_v < 20: parts.append("Stoch below 20")
-        if not np.isnan(rsi_v) and rsi_v < 40:     parts.append("RSI below 40")
+        if not np.isnan(stoch_v) and stoch_v < 20: parts.append("Stoch<20")
+        if not np.isnan(rsi_v) and rsi_v < 40:     parts.append("RSI<40")
         side = 1
     elif cloud_pos == "above":
         parts = ["above thick cloud"]
-        if not np.isnan(stoch_v) and stoch_v > 80: parts.append("Stoch above 80")
-        if not np.isnan(rsi_v) and rsi_v > 60:     parts.append("RSI above 60")
+        if not np.isnan(stoch_v) and stoch_v > 80: parts.append("Stoch>80")
+        if not np.isnan(rsi_v) and rsi_v > 60:     parts.append("RSI>60")
         side = -1
     else:
         return "", "", 0
@@ -387,135 +464,38 @@ def setup_grade(cloud_pos: str, thick_band: str, rsi_v: float, stoch_v: float) -
     return " + ".join(parts), tier, side
 
 
-
-# =============================================================================
-# TESTED AND NOT ADOPTED
-# =============================================================================
-# Three more candidates were run through the same pooled/split-half protocol
-# as everything above, on the 28-instrument daily set. None cleared the bar,
-# so none are wired in. Recorded here rather than silently dropped, same
-# reason the H4 held-out failure above is written out in full.
-#
-#   RSI DIVERGENCE (price lower-low + RSI higher-low, and mirror at highs).
-#   The naive version looked spectacular - +0.81%/trade, 70% win, PF 3.6 -
-#   because it used the swing point's own bar as the signal date. A fractal
-#   low/high needs bars AFTER it to confirm it was actually a low/high, so
-#   that version knew the future. Shifted to the earliest date the pattern
-#   is actually knowable, it inverts: -0.08%/trade, 50% win, PF 0.89, FAILS
-#   the split test. Stacked on top of the existing cloud+stoch+rsi signal it
-#   does not help either (n=171, FAILS). Bare RSI divergence is not a filter
-#   worth having - this is the same lesson as "RSI<30 loses money" from the
-#   earlier XAUUSD work, generalised to 28 pairs.
-#
-#   BOLLINGER SQUEEZE AVOIDANCE (skip entries when 20-period band width is
-#   in its own bottom quartile - i.e. an unusually quiet market). Requiring
-#   price outside the bands as extra confirmation is a wash (+0.18% vs the
-#   +0.15% baseline, not a clean improvement). But entering DURING a squeeze
-#   specifically is worse and fails the split (+0.00% vs +0.18% outside one) -
-#   a compressed market makes the cloud/stoch/rsi extremes less trustworthy.
-#   Not wired in as its own module because quality_score()'s ADX component
-#   below already screens out most of the same low-conviction bars.
-#
-#   PATIENCE / LIMIT ENTRY (resting a limit order 0.25-1.0x ATR further into
-#   the extreme instead of taking the signal bar's close, waiting up to 2-8
-#   days to be filled). Return per trade stayed flat to slightly worse as the
-#   limit was set further away, while fill rate fell from 99% to 45%. Waiting
-#   for a "better" price mostly means missing the trades that worked without
-#   you, not catching better fills on the ones that would have anyway. This
-#   is itself an answer to "where's the best place to enter" - it's close to
-#   the alert itself; the closed bar this fires on is already close to
-#   optimal, which is the other reason nothing in entry_plan() below tries
-#   to time a better fill.
-# =============================================================================
-
-
-def quality_score(adx_v: float, vol_curr: float, vol_avg20: float, weekday: int) -> tuple[int, str]:
+def quality_score(stack_tier: str, adx_v: float, chop_v: float) -> int:
     """
-    A secondary filter for setups that ALREADY have a stacked (or better)
-    cloud+stoch+rsi read - not a standalone signal. Three components, each
-    picked because it kept differentiating cleanly through both halves of
-    the sample where the others above (divergence, squeeze, patience) didn't.
+    A 0-5 at-a-glance score built by EXTENDING stack_tier above, not
+    replacing it. stack_tier already IS a 1-3 quality read (base=1,
+    stacked=2, full stack=3 - how many of {thick cloud, Stoch, RSI} fired),
+    and that 1-3 part is the piece this project has actually validated
+    (pooled/spread-charged/split-half - see setup_grade()'s docstring).
 
-    Measured on the tier>=2 ("stacked"/"full stack") condition, 28 pairs,
-    daily, 10-day forward, spread charged, both halves shown as h1 / h2:
+    The extra two points come from data the bot already computes and add
+    NOTHING new to fetch or store:
+      +1  ADX >= 25   (a trend is actually present)
+      +1  Chop < 38   (a directional move is underway)
 
-        ADX >= 25 at signal        +0.225%/trade  54.5% win  [h1 +0.34% / h2 +0.13%]
-        ADX <  25 at signal        +0.064%/trade  53.0% win  [h1 +0.20% / h2 -0.06%  FAILS]
-        volume > 1.2x its 20d avg  +0.217%/trade  54.4% win  [h1 +0.33% / h2 +0.12%]
-        volume <= 1.2x its 20d avg +0.119%/trade  53.5% win  [h1 +0.25% / h2  0.00%]
-        entered Mon/Tue/Wed        +0.167%/trade  54.0% win  [OK in both halves]
-        entered Thu/Fri            +0.112%/trade  53.0% win  [Thu and Fri EACH fail alone]
+    IMPORTANT CAVEAT: those two extra points are NOT validated as quality
+    signals. This project already tested ADX/Choppiness as a hard GATE on
+    the RSI signal and found it made results worse, not better (see
+    regime_tag()'s docstring). Using them here as additive, non-gating
+    context is a different claim than gating - but it is an UNTESTED one
+    until it goes through the same split-half protocol everything else
+    here has been through. Read "5/5" as "more context lines up," not as
+    "more likely to work" - the same warning setup_grade() gives about not
+    reading "full stack" as better than "base" applies here too.
 
-    Combined into a 0-3 score, the relationship is monotonic and every level
-    passes the split test (n=1,620 at 3/3):
-
-        0/3  +0.156%   1/3  +0.173%   2/3  +0.229%   3/3  +0.304%/trade
-
-    Tried the same combined score on the WEAK tier==1 ("base", cloud position
-    alone) condition to see if quality could rescue it - it can't: 0/3 -0.032%,
-    3/3 +0.010%. Quality separates good setups from better ones; it doesn't
-    turn a bad one into a good one. So this is gated on stack_tier already
-    being "stacked" or "full stack" in check_all(), never applied alone.
-
-    ADX and weekday are always knowable. Volume is NOT reliable for FX on
-    Yahoo (spot pairs are OTC - the =X tickers frequently report 0 volume;
-    futures/index tickers like GC=F, SI=F, DX-Y.NYB generally do report it).
-    When volume looks unusable this degrades gracefully to a /2 score built
-    from ADX and weekday only, flagged as such in the label.
+    Returns 0 when there is no stack at all (stack_tier == "").
     """
-    score = 0
-    parts = []
-    if not np.isnan(adx_v) and adx_v >= 25:
-        score += 1; parts.append("ADX")
-    vol_usable = vol_curr > 0 and vol_avg20 > 0 and not (np.isnan(vol_curr) or np.isnan(vol_avg20))
-    if vol_usable and vol_curr > 1.2 * vol_avg20:
-        score += 1; parts.append("Vol")
-    if weekday <= 2:  # Mon=0 .. Wed=2
-        score += 1; parts.append("Mon-Wed")
-    denom = 3 if vol_usable else 2
-    stars = "★" * score + "☆" * (denom - score)
-    label = f"{stars} quality {score}/{denom}" + ("" if vol_usable else " (no volume data)")
-    if parts:
-        label += f" · {'+'.join(parts)}"
-    return score, label
-
-
-def entry_plan(price: float, atr_v: float, side: int,
-                stop_mult: float = ATR_STOP_MULT, target_mult: float = ATR_TARGET_MULT) -> str:
-    """
-    Concrete stop/target levels for a stacked (or better) signal, in place of
-    firing an alert with no risk framing at all - the gap flagged early on in
-    this project ("no stop loss anywhere in this test... not a number to
-    trade on"). ATR-based rather than a fixed pip count, so it scales with
-    each pair's own volatility automatically.
-
-    Multiples chosen from a sweep (triple-barrier: whichever of stop/target/
-    20-day time-exit is hit first), tier>=2 stack, 28 pairs, daily:
-
-        stop / target     avg R    win%    PF     split
-        1.0 / 1.0 ATR     +0.061   53.0%  1.13    OK
-        1.5 / 2.0 ATR     +0.121   47.2%  1.16    OK
-        2.0 / 3.0 ATR     +0.168   47.9%  1.18    OK   <- default below
-        2.5 / 2.5 ATR     +0.190   54.3%  1.20    OK
-        3.0 / 2.0 ATR     +0.176   60.0%  1.20    OK
-
-    PF sits in a tight, unremarkable 1.13-1.20 band across every combination
-    tried and every one passes the split test - unlike an earlier ATR sweep
-    on a different (rejected) setup, where PF swung from 0.99 to 1.19 and
-    that instability was itself the reason to walk away. Stability here is
-    mild reassurance, not proof of edge; treat the R:R math as a risk
-    framework, not a forecast. Widening the stop tends to raise PF (lets a
-    mean-reversion trade breathe) more than widening the target does.
-    """
-    if np.isnan(atr_v) or atr_v <= 0:
-        return ""
-    stop_px = price - side * stop_mult * atr_v
-    tgt_px = price + side * target_mult * atr_v
-    rr = target_mult / stop_mult
-    arrow = "below" if side > 0 else "above"   # long: stop below entry; short: stop above entry
-    return (f"🎯 <b>Entry plan</b> ({stop_mult:.1f}x/{target_mult:.1f}x ATR, {rr:.1f}R, PF 1.18 in backtest - not a forecast)\n"
-            f"   Stop {stop_px:,.4f} · Target {tgt_px:,.4f} · ATR {atr_v:,.4f}\n"
-            f"   Stop sits {arrow} entry; this is where the setup is invalidated, not where price is expected to go.")
+    base_pts = {"": 0, "base": 1, "stacked": 2, "full stack": 3}.get(stack_tier, 0)
+    if base_pts == 0:
+        return 0
+    extra = 0
+    if not np.isnan(adx_v) and adx_v >= 25:  extra += 1
+    if not np.isnan(chop_v) and chop_v < 38: extra += 1
+    return base_pts + extra
 
 
 def board_note(votes: int) -> str:
@@ -558,10 +538,7 @@ def explainer() -> str:
             "held-out H4, and that was not significant. Trend indicators read "
             "backwards on FX because these pairs mean-revert. Small effects, "
             "never forward-tested. Treat every alert as a place to look, not a "
-            "reason to trade. The quality score and entry plan (28 pairs incl. "
-            "gold/silver, same protocol) are calibration, not a forecast — RSI "
-            "divergence, a squeeze filter, and waiting for a better fill were all "
-            "tried and rejected on the same data.</i>")
+            "reason to trade.</i>")
 
 
 def plain_read(side: int, tier: str, cloud_pos: str, band: str,
@@ -611,6 +588,179 @@ def plain_read(side: int, tier: str, cloud_pos: str, band: str,
             f"Treat as awareness only. Context: {regime}.")
 
 
+# ==========================================================================
+# LAYER 7 — PORTFOLIO CORRELATION / EXPOSURE GUARDRAILS
+# ==========================================================================
+# Neither function below blocks an alert from firing. This project already
+# found that hard-gating the RSI signal on a second indicator (regime) made
+# results worse, not better - so these are printed alongside the digest for
+# a human to act on, not wired in as a filter. What they catch: several
+# "independent" setups this run that are actually one leveraged bet wearing
+# different tickets.
+
+_FX_SPECIAL_LEGS = {"GOLD": ("XAU", "USD"), "SILVER": ("XAG", "USD"),
+                     "DXY": ("USD", "DXY_BASKET")}
+
+
+def currency_legs(name: str) -> tuple[str, str] | None:
+    """Decompose a WATCHLIST name into (base, quote) legs. Gold/silver get a
+    synthetic USD leg so a XAU long still nets against other USD exposure.
+    DXY gets its own synthetic basket leg rather than raw USD, since DXY is
+    a basket instrument, not a bilateral pair - folding it into USD directly
+    would misstate the netting."""
+    if name in _FX_SPECIAL_LEGS:
+        return _FX_SPECIAL_LEGS[name]
+    if len(name) == 6:
+        return name[:3], name[3:]
+    return None
+
+
+def net_currency_exposure(active: list[tuple[str, int]]) -> dict[str, float]:
+    """
+    Net exposure per currency across every setup flagged THIS run, not just
+    per-pair risk. Two long stack signals on EURUSD and EURGBP look like two
+    independent 1%-risk trades; both are actually +EUR, so taking both is one
+    ~2x EUR bet wearing two tickets.
+
+    active: [(instrument_name, side), ...], side = stack_side (+1/-1) from
+    setup_grade() - i.e. only instruments with a live stack_label this run.
+
+    Returns net exposure per currency in units of "number of stacked same-
+    direction setups" (a count, not a risk %) - deliberately not converted
+    to % of equity here, since that would conflate the correlation problem
+    with the separate sizing decision made in kelly_size() below.
+    """
+    net: dict[str, float] = {}
+    for name, side in active:
+        legs = currency_legs(name)
+        if legs is None:
+            net[name] = net.get(name, 0.0) + side
+            continue
+        base, quote = legs
+        net[base] = net.get(base, 0.0) + side
+        net[quote] = net.get(quote, 0.0) - side
+    return net
+
+
+def exposure_warnings(net: dict[str, float], max_net: float = MAX_NET_CCY_EXPOSURE) -> list[str]:
+    """Currencies where stacked same-direction setups reach/exceed max_net."""
+    warn = []
+    for ccy, val in sorted(net.items(), key=lambda x: -abs(x[1])):
+        if abs(val) >= max_net:
+            warn.append(f"{ccy}: {val:+.1f} net {'long' if val > 0 else 'short'} across active setups")
+    return warn
+
+
+def pair_correlation(closes: dict[str, pd.Series], window: int = CORR_WINDOW) -> pd.DataFrame:
+    """
+    Rolling correlation of daily log returns between currently-ACTIVE pairs
+    only (not all 31 - a full matrix is expensive and mostly irrelevant to
+    exposure you don't actually hold). Catches co-movement currency-netting
+    can't see - e.g. AUDUSD and NZDUSD share no currency leg but both trade
+    as commodity-bloc/risk-sentiment currencies.
+
+    closes: {instrument_name: recent Close series}, already aligned.
+    NOTE: this reads a CALM trailing window. Crisis periods push correlated
+    pairs toward +/-1 - if this matters for sizing, re-run it against a
+    stressed historical window too, not just the live trailing one.
+    """
+    if len(closes) < 2:
+        return pd.DataFrame()
+    rets = pd.DataFrame({k: np.log(v).diff() for k, v in closes.items()}).dropna()
+    if len(rets) < window:
+        return pd.DataFrame()
+    return rets.tail(window).corr()
+
+
+def correlation_warnings(corr: pd.DataFrame, threshold: float = CORR_THRESHOLD) -> list[str]:
+    warn = []
+    if corr.empty:
+        return warn
+    cols = list(corr.columns)
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            rho = corr.iloc[i, j]
+            if abs(rho) >= threshold:
+                warn.append(f"{cols[i]} / {cols[j]}: ρ={rho:+.2f}")
+    return warn
+
+
+# ==========================================================================
+# LAYER 8 — POSITION SIZING (fractional Kelly, from the bot's OWN live data)
+# ==========================================================================
+def kelly_from_tally(tally_entry: dict) -> tuple[float, str] | None:
+    """
+    Full Kelly fraction f* = p - q/b from one entry of state["_tally"] - the
+    bot's own live forward-outcome log (see the LOG_OUTCOMES block in
+    check_all()), NOT a backtest figure. p = win rate, q = 1-p, b = payoff
+    ratio (avg win / avg loss).
+
+    b is computed from the tally's running win_sum/loss_sum when present -
+    the correct avg-win/avg-loss definition. Tally entries recorded before
+    that split existed (or that haven't scored a full outcome under it yet)
+    fall back to |best|/|worst|, a coarser approximation from the extremes
+    only. Returns (f*, method) so the caller can say which one was used
+    rather than silently presenting an approximation as precise.
+
+    Returns None below MIN_TRADES_FOR_KELLY (sample too thin to trust the
+    win rate at all - see this project's own ~1,100-trade significance
+    calculations elsewhere), or if the sample has no losses/no wins (b
+    undefined).
+    """
+    n = tally_entry.get("n", 0)
+    if n < MIN_TRADES_FOR_KELLY:
+        return None
+    wins = tally_entry.get("wins", 0)
+    losses = n - wins
+    if wins == 0 or losses == 0:
+        return None
+    p = wins / n
+    q = 1 - p
+
+    win_sum, loss_sum = tally_entry.get("win_sum"), tally_entry.get("loss_sum")
+    if win_sum is not None and loss_sum is not None and win_sum > 0 and loss_sum < 0:
+        avg_win, avg_loss = win_sum / wins, abs(loss_sum / losses)
+        b = avg_win / avg_loss if avg_loss > 0 else None
+        method = "avg win/loss"
+    else:
+        best, worst = tally_entry.get("best"), tally_entry.get("worst")
+        b = abs(best / worst) if best and worst and worst != 0 else None
+        method = "best/worst approx"
+
+    if not b or b <= 0:
+        return None
+    return p - q / b, method
+
+
+def kelly_size(tally_entry: dict | None, equity: float = ACCOUNT_EQUITY,
+               stop_pct: float | None = None) -> dict:
+    """
+    Turn one tally entry into a concrete size: a dollar risk amount and,
+    given a stop distance, a notional position size - same spirit as an ATR
+    stop, a number instead of a vibe.
+
+    Falls back to a small FIXED risk % (never scaled up) whenever the sample
+    is too thin for Kelly to mean anything - an untested condition has no
+    measured edge to size against, so the fallback stays flat rather than
+    guessing at one.
+
+    stop_pct: stop distance as a fraction of price (e.g. ATR_STOP_MULT *
+    atr / price). Pass None to get the risk verdict without a notional size.
+    """
+    result = kelly_from_tally(tally_entry) if tally_entry else None
+    if result is None or result[0] <= 0:
+        risk_pct = DEFAULT_RISK_PCT
+        basis = "fallback — sample below the trust threshold or no measured edge yet"
+    else:
+        f_raw, method = result
+        risk_pct = min(f_raw * KELLY_FRACTION, MAX_RISK_PCT)
+        basis = f"half-Kelly of live f*={f_raw:.3f} ({method}, n={tally_entry.get('n')})"
+    risk_amount = equity * risk_pct
+    notional = (risk_amount / stop_pct) if stop_pct else None
+    return {"risk_pct": risk_pct, "risk_amount": round(risk_amount, 2),
+            "notional": round(notional, 2) if notional else None, "basis": basis}
+
+
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         try:
@@ -638,130 +788,13 @@ def send_telegram(text: str, dry: bool = False) -> bool:
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=20)
-        if r.status_code == 200:
-            return True
-        print(f"  !! Telegram error {r.status_code}: {r.text[:200]}")
-        if r.status_code == 400 and "can't parse entities" in r.text:
-            # A malformed <tag> somewhere in the text (stray '<'/'>' from an
-            # f-string, not real HTML) makes Telegram reject the WHOLE message -
-            # the alert silently vanishes rather than arriving ugly. That's a
-            # worse failure than ugly formatting, so retry once as plain text
-            # with the tags stripped instead of trusting parse_mode at all.
-            plain = re.sub(r"<[^>]+>", "", text)
-            r2 = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": plain},
-                timeout=20)
-            if r2.status_code == 200:
-                print("  -> recovered: sent as plain text after HTML parse error")
-                return True
-            print(f"  !! plain-text retry also failed {r2.status_code}: {r2.text[:200]}")
-        return False
+        if r.status_code != 200:
+            print(f"  !! Telegram error {r.status_code}: {r.text[:200]}")
+            return False
+        return True
     except Exception as e:
         print(f"  !! Telegram send failed: {e}")
         return False
-
-
-FMP_METALS = {"GC=F": "GCUSD", "SI=F": "SIUSD"}   # Yahoo futures ticker -> FMP commodity symbol
-
-
-def fmp_symbol(ticker: str) -> str:
-    """
-    Yahoo's 'EURUSD=X' -> FMP's 'EURUSD', or Yahoo's 'GC=F'/'SI=F' -> FMP's
-    'GCUSD'/'SIUSD'. Gold and silver are included because they were part of
-    the same 28-instrument backtest that validated quality_score() and
-    entry_plan() - this isn't a new, untested instrument class, just the
-    same safety net extended to two pairs already in scope. Confirmed live
-    against FMP's commodities-historical-price-eod-full endpoint before
-    adding: real, non-zero, varying volume, same OHLCV field shape as forex.
-
-    Deliberately NOT extended to DXY, equity indices, Brent, or crypto, even
-    though this project's CSV data covers all of them - those were never
-    part of the tested stack. Widening the watchlist to new instrument
-    classes is a backtest decision, not an API-quota one; the 250-calls/day
-    headroom is not itself a reason to point the same untested logic at a
-    new market.
-    """
-    if ticker.endswith("=X"):
-        return ticker[:-2]
-    return FMP_METALS.get(ticker)
-
-
-def fmp_get(symbol: str, from_date: str | None = None, to_date: str | None = None):
-    """Raw call to FMP's forex EOD endpoint. Returns a list of daily bars
-    (newest first) or None on any failure - callers must treat this as
-    optional and fall back to Yahoo-only behaviour, never raise."""
-    if not FMP_API_KEY:
-        return None
-    params = {"symbol": symbol, "apikey": FMP_API_KEY}
-    if from_date: params["from"] = from_date
-    if to_date:   params["to"] = to_date
-    try:
-        r = requests.get("https://financialmodelingprep.com/stable/historical-price-eod/full",
-                          params=params, timeout=20)
-        if r.status_code != 200:
-            return None
-        rows = r.json()
-        return rows if isinstance(rows, list) and rows else None
-    except Exception:
-        return None
-
-
-def fmp_daily_snapshot(state: dict, tickers: list[str]) -> dict:
-    """
-    Latest close + a short volume history per FX pair, refreshed once per
-    UTC calendar day and cached in the state file - NOT once per hourly
-    run, which would burn ~26 calls/hour (600+/day) against FMP's 250/day
-    free quota for data that only changes once a day. ~30 calendar days
-    (~20 trading days) is fetched so a 20-period volume average can be
-    built from FMP data alone on pairs where Yahoo's own volume series is
-    entirely zero, not just the latest bar.
-    """
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if state.get("_fmp_date") == today and state.get("_fmp_cache"):
-        return state["_fmp_cache"]
-    cache = {}
-    since = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
-    for tk in tickers:
-        sym = fmp_symbol(tk)
-        if not sym:
-            continue
-        rows = fmp_get(sym, from_date=since, to_date=today)
-        if rows:
-            try:
-                vols = [float(r.get("volume", 0) or 0) for r in rows[:21]]
-                cache[tk] = {"date": rows[0]["date"], "close": float(rows[0]["close"]),
-                             "volume": vols[0] if vols else 0.0,
-                             "vol_avg20": (sum(vols[1:21]) / len(vols[1:21])) if len(vols) > 1 else 0.0}
-            except Exception:
-                pass
-        time.sleep(0.25)   # gentle pacing, no published per-minute cap on the free tier
-    state["_fmp_cache"] = cache
-    state["_fmp_date"] = today
-    return cache
-
-
-def fmp_full_df(ticker: str):
-    """
-    TRUE fallback: full price history for one pair from FMP, reshaped to
-    look exactly like what fetch_batch() returns from Yahoo (Open/High/Low/
-    Close/Volume, ascending DatetimeIndex) so it can drop straight into the
-    same RSI/ATR/Ichimoku/Stochastic pipeline with no special-casing
-    downstream. Only called for a ticker Yahoo returned nothing for - not
-    cached, since this should be a rare event, not a routine path.
-    """
-    sym = fmp_symbol(ticker)
-    if not sym:
-        return None
-    rows = fmp_get(sym)
-    if not rows or len(rows) < RSI_LENGTH + 5:
-        return None
-    df = pd.DataFrame(rows)
-    df["dt"] = pd.to_datetime(df["date"])
-    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low",
-                             "close": "Close", "volume": "Volume"})
-    df = df[["dt", "Open", "High", "Low", "Close", "Volume"]].set_index("dt").sort_index()
-    return df
 
 
 def fetch_batch(tickers: list[str], interval: str) -> dict[str, pd.DataFrame]:
@@ -803,32 +836,99 @@ def fetch_batch(tickers: list[str], interval: str) -> dict[str, pd.DataFrame]:
     return out
 
 
+def fetch_cot(contract_substring: str) -> dict | None:
+    """
+    Latest CFTC Legacy Futures-Only row for a currency/metal futures
+    contract, matched by substring against market_and_exchange_names (SoQL
+    LIKE, case- and spacing-tolerant). Returns speculative (non-commercial)
+    net position and week-over-week change, or None on any failure - a COT
+    hiccup must never break the RSI checks everything else here depends on.
+
+    Free, no API key. Data itself is weekly (Tuesday positions, released
+    the following Friday ~3:30pm ET) - see COT_CACHE_DAYS in CONFIG for why
+    this isn't called every run.
+    """
+    try:
+        params = {
+            "$limit": 1,
+            "$order": "report_date_as_yyyy_mm_dd DESC",
+            "$where": (f"market_and_exchange_names like '%{contract_substring}%' "
+                       f"AND futonly_or_combined = 'FutOnly'"),
+        }
+        r = requests.get(COT_URL, params=params, timeout=20)
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return None
+        row = rows[0]
+        long_ = float(row["noncomm_positions_long_all"])
+        short_ = float(row["noncomm_positions_short_all"])
+        chg_long = float(row.get("change_in_noncomm_long_all") or 0)
+        chg_short = float(row.get("change_in_noncomm_short_all") or 0)
+        oi = float(row.get("open_interest_all") or 0)
+        net = long_ - short_
+        return {
+            "date": row["report_date_as_yyyy_mm_dd"][:10],
+            "net": net,
+            "net_chg": chg_long - chg_short,
+            "pct_oi": (net / oi * 100) if oi else None,
+        }
+    except Exception as e:
+        print(f"  !! COT fetch failed for {contract_substring}: {e}")
+        return None
+
+
+def cot_context(name: str, cache: dict) -> str:
+    """One compact COT context line for `name`, or "" if not covered or not
+    yet cached. `cache` is state["_cot_cache"] - refreshed in check_all()
+    at most once every COT_CACHE_DAYS."""
+    if name not in COT_CONTRACTS:
+        return ""
+    c = cache.get(name)
+    if not c:
+        return ""
+    arrow = "↑" if c["net_chg"] > 0 else "↓" if c["net_chg"] < 0 else "→"
+    side = "net long" if c["net"] > 0 else "net short"
+    pct = f" ({c['pct_oi']:+.0f}% OI)" if c.get("pct_oi") is not None else ""
+    return f"COT spec {side} {abs(c['net']):,.0f}{pct} {arrow} · {c['date']}"
+
+
 def check_all(dry: bool = False) -> int:
     state = load_state()
     sent = 0
     now = datetime.now(timezone.utc)
     stamp = now.strftime("%Y-%m-%d %H:%M UTC")
     extended: list[tuple] = []
+    active_setups: list[tuple[str, int]] = []   # Layer 7: (name, side) for every live stack this run
+    daily_closes: dict[str, pd.Series] = {}      # Layer 7: 1d closes, for the correlation check
+
+    # ---- COT refresh (weekly data - cache it, don't hit it every run) ----
+    cot_cache = state.setdefault("_cot_cache", {})
+    last_cot = state.get("_cot_last_fetch")
+    need_cot_refresh = True
+    if last_cot:
+        try:
+            need_cot_refresh = (now - datetime.fromisoformat(last_cot)) >= timedelta(days=COT_CACHE_DAYS)
+        except Exception:
+            need_cot_refresh = True
+    if need_cot_refresh:
+        for nm, contract in COT_CONTRACTS.items():
+            if nm not in WATCHLIST:
+                continue
+            c = fetch_cot(contract)
+            if c:
+                cot_cache[nm] = c
+        state["_cot_last_fetch"] = now.isoformat()
 
     for tf in TIMEFRAMES:
         data = fetch_batch(list(WATCHLIST.values()), tf)
         print(f"\n  --- {tf} ({len(data)}/{len(WATCHLIST)} fetched) ---")
 
-        # FMP snapshot: only meaningful on the daily timeframe (see CONFIG note).
-        fmp_cache = fmp_daily_snapshot(state, list(WATCHLIST.values())) \
-                    if (tf == "1d" and FMP_API_KEY) else {}
-
         for name, ticker in WATCHLIST.items():
             df = data.get(ticker)
-            used_fmp_fallback = False
             if df is None:
-                if tf == "1d" and FMP_API_KEY:
-                    df = fmp_full_df(ticker)
-                    used_fmp_fallback = df is not None
-                if df is None:
-                    print(f"  {name}|{tf:<3}  no data" + ("" if not FMP_API_KEY else " (yahoo+fmp)"))
-                    continue
-                print(f"  {name}|{tf:<3}  Yahoo had nothing - using FMP fallback")
+                print(f"  {name}|{tf:<3}  no data")
+                continue
 
             r = rsi_wilder(df["Close"], RSI_LENGTH).dropna()
             if len(r) < 3:
@@ -840,24 +940,15 @@ def check_all(dry: bool = False) -> int:
             price = float(df["Close"].iloc[-2])
             bar_id = str(df.index[-2])
 
-            # Cross-check against FMP when both sources have a value, logged
-            # only (never acted on) - Yahoo stays the source of truth for
-            # every calculation above and below this line.
-            fmp_row = fmp_cache.get(ticker)
-            if fmp_row and not used_fmp_fallback:
-                gap = abs(price - fmp_row["close"]) / price if price else 0
-                if gap > FMP_PRICE_TOLERANCE:
-                    print(f"  {name}|{tf:<3}  !! price gap vs FMP: yahoo {price:.5f} "
-                          f"vs fmp {fmp_row['close']:.5f} ({gap*100:.2f}%)")
-
             # Regime context. Read on the same closed bar as the RSI value.
             try:
                 a_s, dip_s, dim_s = adx_dmi(df)
                 adx_v = float(a_s.iloc[-2])
                 chop_v = float(choppiness(df).iloc[-2])
+                atr_v = float(atr(df).iloc[-2])
                 dir_v = "+DI" if float(dip_s.iloc[-2]) > float(dim_s.iloc[-2]) else "-DI"
             except Exception:
-                adx_v = chop_v = float("nan"); dir_v = "?"
+                adx_v = chop_v = atr_v = float("nan"); dir_v = "?"
             tag = regime_tag(adx_v, chop_v)
             try:
                 dirline, votes = direction_panel(df, dir_v == "+DI")
@@ -873,41 +964,66 @@ def check_all(dry: bool = False) -> int:
                 stoch_v = stochastic(df)
             except Exception:
                 stoch_v = float("nan")
+            try:
+                z_series = zscore(df["Close"])
+                z_v = float(z_series.iloc[-2])
+                z_prev = float(z_series.iloc[-3])
+                hv_v = float(hv_percentile(df["Close"]).iloc[-2])
+            except Exception:
+                z_v = z_prev = hv_v = float("nan")
+            try:
+                kelt_upper, kelt_lower = keltner(df)
+                ku_curr, kl_curr = float(kelt_upper.iloc[-2]), float(kelt_lower.iloc[-2])
+                ku_prev, kl_prev = float(kelt_upper.iloc[-3]), float(kelt_lower.iloc[-3])
+                c_prev = float(df["Close"].iloc[-3])
+            except Exception:
+                ku_curr = kl_curr = ku_prev = kl_prev = c_prev = float("nan")
             stack_label, stack_tier, stack_side = setup_grade(cpos, cband, curr, stoch_v)
+            qscore = quality_score(stack_tier, adx_v, chop_v)
             read = plain_read(stack_side, stack_tier, cpos, cband,
                               curr, stoch_v, adx_v, chop_v, "")
 
-            # ATR for the entry plan, plus the inputs quality_score() needs.
-            # Everything here is read off the same closed bar as the RSI value.
-            try:
-                atr_v = float(atr_wilder(df, ATR_LENGTH).iloc[-2])
-            except Exception:
-                atr_v = float("nan")
-            try:
-                vol_curr = float(df["Volume"].iloc[-2])
-                vol_avg20 = float(df["Volume"].rolling(20).mean().iloc[-2])
-            except Exception:
-                vol_curr = vol_avg20 = float("nan")
-            # Yahoo's =X forex volume is frequently 0 for every bar, not just
-            # today's - patch both the current value AND the 20-period
-            # average from the FMP snapshot when Yahoo's own series is
-            # unusable, so the ratio quality_score() computes stays meaningful.
-            if (not vol_avg20 or np.isnan(vol_avg20) or vol_avg20 == 0) and fmp_row:
-                vol_curr = fmp_row["volume"]
-                vol_avg20 = fmp_row["vol_avg20"]
-            weekday = df.index[-2].weekday()
-            is_stacked = stack_tier in ("stacked", "full stack")
-            qscore, qlabel = quality_score(adx_v, vol_curr, vol_avg20, weekday) if is_stacked else (0, "")
+            # Layer 7 tracking: every live stack this run feeds the portfolio
+            # exposure/correlation check that runs once, after the tf loop.
+            kelly = None
+            if stack_label:
+                active_setups.append((name, stack_side))
+                tk = f"{stack_tier}|{OUTCOME_HORIZONS[0]}d"
+                stop_pct = (ATR_STOP_MULT * atr_v / price) if not np.isnan(atr_v) and price else None
+                kelly = kelly_size(state.get("_tally", {}).get(tk), stop_pct=stop_pct)
+            if tf == "1d":
+                daily_closes[name] = df["Close"]
+
+            # One-line verdict up top - direction, tier, quality, size - so
+            # the decision-relevant bit is visible even in a truncated phone
+            # notification preview, before the fuller narrative below it.
+            verdict = ("" if not stack_label else
+                       f"🎯 <b>{'LONG' if stack_side > 0 else 'SHORT'}</b> · {stack_tier} "
+                       f"· Quality {qscore}/5"
+                       + (f" · risk {kelly['risk_pct']*100:.2f}% (${kelly['risk_amount']:,.0f})"
+                          if kelly else "")
+                       + "\n\n")
+
+            # Trend board + cloud + regime, compacted from 4 lines to 2 -
+            # same information, faster to scan.
+            board_line = ""
+            if dirline:
+                note = board_note(votes)
+                board_line = dirline + (f" · <i>{note}</i>" if note else "") + "\n"
+            detail_line = (f"{cloud} · " if cloud else "") + f"ADX {adx_v:.0f} · Chop {chop_v:.0f} · <i>{tag}</i>"
+            extra_bits = []
+            if not np.isnan(z_v):  extra_bits.append(f"Z {z_v:+.1f}")
+            if not np.isnan(hv_v): extra_bits.append(f"HVpct {hv_v:.0f}")
+            cot_line = cot_context(name, cot_cache)
+            if cot_line: extra_bits.append(cot_line)
+            extra_line = (" · ".join(extra_bits) + "\n") if extra_bits else ""
 
             ctx = ("" if not tag else
-                   f"{read}\n\n"
-                   + (f"{dirline}\n" if dirline else "")
-                   + (f"   ↳ <i>{board_note(votes)}</i>\n" if board_note(votes) else "")
-                   + (f"{cloud}\n" if cloud else "")
-                   + (f"⚑ <b>{stack_label}</b> ({stack_tier}, "
-                      f"{'long' if stack_side > 0 else 'short'} side)\n" if stack_label else "")
-                   + (f"{qlabel}\n" if (SHOW_QUALITY and qlabel) else "")
-                   + f"ADX {adx_v:.0f} · Chop {chop_v:.0f} · <i>{tag}</i>")
+                   verdict
+                   + f"{read}\n\n"
+                   + board_line
+                   + detail_line + "\n"
+                   + extra_line)
 
             if curr >= DIGEST_ABOVE or curr <= DIGEST_BELOW:
                 extended.append((name, tf, curr))
@@ -941,23 +1057,10 @@ def check_all(dry: bool = False) -> int:
                 else:
                     icon = "🔵🔵" if lv <= 20 else "🔵" if lv <= 25 else "📉"
                     word = "oversold"
-
-                # Entry plan only attaches when the cloud+stoch+rsi stack is
-                # ALSO at "stacked" or better AND agrees with THIS crossing's
-                # direction - a BELOW crossing (oversold) needs stack_side==1,
-                # an ABOVE crossing (overbought) needs stack_side==-1. A bare
-                # level cross with no stack behind it never gets one; that
-                # combination was never the condition that was tested.
-                crossing_side = 1 if direction == "BELOW" else -1
-                plan = (entry_plan(price, atr_v, crossing_side)
-                        if (SHOW_ENTRY_PLAN and is_stacked and stack_side == crossing_side) else "")
-
                 msg = (f"{icon} <b>{name}</b> · {tf}\n"
-                       f"RSI({RSI_LENGTH}) crossed <b>{direction} {lv}</b> ({word})\n"
-                       f"RSI now <b>{curr:.1f}</b> (was {prev:.1f})\n"
-                       f"Price {price:,.4f}\n"
+                       f"RSI({RSI_LENGTH}) crossed <b>{direction} {lv}</b> ({word}) "
+                       f"→ <b>{curr:.1f}</b> (was {prev:.1f}) · {price:,.4f}\n"
                        + (f"{ctx}\n" if ctx else "")
-                       + (f"\n{plan}\n" if plan else "")
                        + f"<i>{stamp} · closed bar</i>"
                        + (f"\n\n{explainer()}" if SHOW_EXPLAINER else ""))
                 if send_telegram(msg, dry):
@@ -965,9 +1068,78 @@ def check_all(dry: bool = False) -> int:
                     state[key] = bar_id
                     print(f"  {name}|{tf:<3}  ALERT {direction} {lv}  (RSI {curr:.1f})")
 
+            # ---- Z-score / Keltner reversion alerts --------------------------
+            # Phase 2 validated, daily-only (see REVERSION_HORIZON_DAYS in
+            # CONFIG) - independent of the RSI-crossing signal above, never
+            # combined with each other. Two separate signal types, each with
+            # its own dedup key, tally key, and Kelly sizing lookup.
+            if tf == "1d":
+                zrev_long = (not np.isnan(z_prev) and z_prev > -ZREV_THRESH and z_v <= -ZREV_THRESH)
+                zrev_short = (not np.isnan(z_prev) and z_prev < ZREV_THRESH and z_v >= ZREV_THRESH)
+                keltrev_long = (not np.isnan(kl_prev) and c_prev >= kl_prev and price < kl_curr)
+                keltrev_short = (not np.isnan(ku_prev) and c_prev <= ku_prev and price > ku_curr)
+
+                for sig_name, icon, label, fired, side in [
+                    ("zscore_rev", "🔄", "Z-score reversion", zrev_long, 1),
+                    ("zscore_rev", "🔄", "Z-score reversion", zrev_short, -1),
+                    ("keltner_rev", "〰️", "Keltner reversion", keltrev_long, 1),
+                    ("keltner_rev", "〰️", "Keltner reversion", keltrev_short, -1),
+                ]:
+                    if not fired:
+                        continue
+                    rkey = f"{name}|{tf}|{sig_name}|{'long' if side > 0 else 'short'}"
+                    if state.get(rkey) == bar_id:
+                        continue
+                    active_setups.append((name, side))
+                    tk = f"{sig_name}|{REVERSION_HORIZON_DAYS}d"
+                    stop_pct = (ATR_STOP_MULT * atr_v / price) if not np.isnan(atr_v) and price else None
+                    kelly_r = kelly_size(state.get("_tally", {}).get(tk), stop_pct=stop_pct)
+                    dirword = "LONG" if side > 0 else "SHORT"
+                    pf_note = "1.15" if sig_name == "zscore_rev" else "1.14"
+                    rmsg = (f"{icon} <b>{name}</b> · 1d · {label}\n"
+                            f"{dirword} · {price:,.4f}\n"
+                            f"🎯 <b>{dirword}</b> · risk {kelly_r['risk_pct']*100:.2f}% "
+                            f"(${kelly_r['risk_amount']:,.0f}"
+                            + (f", notional ${kelly_r['notional']:,.0f}" if kelly_r['notional'] else "")
+                            + f") · <i>{kelly_r['basis']}</i>\n"
+                            f"ADX {adx_v:.0f} · Chop {chop_v:.0f} · Z {z_v:+.1f}\n"
+                            f"<i>Phase 2: pooled/spread-charged/split-half PF {pf_note} on "
+                            f"{REVERSION_HORIZON_DAYS}d daily hold. Did NOT clear the held-out "
+                            f"H4 check - daily only, does not stack with the other reversion alert.</i>\n"
+                            f"<i>{stamp} · closed bar</i>")
+                    if send_telegram(rmsg, dry):
+                        sent += 1
+                        state[rkey] = bar_id
+                        print(f"  {name}|{tf:<3}  ALERT {sig_name} {dirword}")
+                    if LOG_OUTCOMES:
+                        pend = state.setdefault("_pending", [])
+                        pkey = f"{name}|{bar_id}|{sig_name}|{REVERSION_HORIZON_DAYS}"
+                        if not any(r.get("key") == pkey for r in pend):
+                            pend.append({"key": pkey, "pair": name, "ticker": ticker, "tf": tf,
+                                         "cond": sig_name, "side": side, "price": price,
+                                         "h": REVERSION_HORIZON_DAYS,
+                                         "due": (now + timedelta(days=int(REVERSION_HORIZON_DAYS*1.45))).isoformat()})
+
             if not events:
                 flag = "  <<" if (curr >= DIGEST_ABOVE or curr <= DIGEST_BELOW) else ""
                 print(f"  {name}|{tf:<3}  RSI {curr:5.1f}  ADX {adx_v:4.0f}  Chop {chop_v:4.0f}{flag}")
+
+    # ---- Layer 7: portfolio exposure across everything flagged this run --
+    active_names = {n for n, _ in active_setups}
+    net_exposure = net_currency_exposure(active_setups)
+    exp_warn = exposure_warnings(net_exposure)
+    corr = pair_correlation({n: daily_closes[n] for n in active_names if n in daily_closes})
+    corr_warn = correlation_warnings(corr)
+    # Standing snapshot for the digest - the top few currencies by |exposure|
+    # regardless of whether they cross MAX_NET_CCY_EXPOSURE, so the digest
+    # shows "here's where things stand" every time, not only when something
+    # trips the warning threshold.
+    top_exposure = [(c, v) for c, v in
+                     sorted(net_exposure.items(), key=lambda x: -abs(x[1]))[:5] if v]
+    if exp_warn or corr_warn:
+        print(f"\n  --- portfolio guardrails ---")
+        for w in exp_warn:  print(f"  exposure: {w}")
+        for w in corr_warn: print(f"  corr:     {w}")
 
     # ---- Forward-outcome logging -----------------------------------------
     # Score anything whose horizon has elapsed, then log today's flags.
@@ -992,8 +1164,14 @@ def check_all(dry: bool = False) -> int:
             t = tally.setdefault(k, {"n": 0, "sum": 0.0, "wins": 0,
                                      "long_n": 0, "long_w": 0, "short_n": 0, "short_w": 0,
                                      "streak": 0, "maxw": 0, "maxl": 0,
-                                     "best": None, "worst": None})
+                                     "best": None, "worst": None,
+                                     "win_sum": 0.0, "loss_sum": 0.0})
+            # setdefault upgrades tally entries created before win_sum/loss_sum
+            # existed, so old live data isn't discarded by this change.
+            t.setdefault("win_sum", 0.0); t.setdefault("loss_sum", 0.0)
             t["n"] += 1; t["sum"] += ret; t["wins"] += (ret > 0)
+            if ret > 0: t["win_sum"] += ret
+            else:       t["loss_sum"] += ret
             if side > 0: t["long_n"] += 1;  t["long_w"] += (ret > 0)
             else:        t["short_n"] += 1; t["short_w"] += (ret > 0)
             # streaks, as on any honest stats panel
@@ -1008,7 +1186,7 @@ def check_all(dry: bool = False) -> int:
         state["_pending"] = still
 
     # ---- Periodic digest of standing conditions --------------------------
-    if DIGEST_EVERY_HOURS > 0 and extended:
+    if DIGEST_EVERY_HOURS > 0 and (extended or top_exposure):
         last = state.get("_last_digest")
         due = True
         if last:
@@ -1028,11 +1206,23 @@ def check_all(dry: bool = False) -> int:
                 lines.append("<b>Oversold (RSI ≤ 30)</b>")
                 lines += [f"  {n} · {t} · <b>{v:.1f}</b>" for n, t, v in os_]
                 lines.append("")
+            if top_exposure:
+                # Standing snapshot every time the digest fires, not just
+                # when something crosses MAX_NET_CCY_EXPOSURE - context,
+                # never a gate.
+                lines.append("<b>📐 Portfolio snapshot</b> (Layer 7 — context, not a gate)")
+                warn_ccys = {w.split(":")[0] for w in exp_warn}
+                lines += [f"  {c}: {v:+.1f}" + (" ⚠️" if c in warn_ccys else "")
+                          for c, v in top_exposure]
+                if corr_warn:
+                    lines += [f"  ρ {w}" for w in corr_warn]
+                lines.append("")
             lines.append(f"<i>{stamp} · standing conditions, not new crossings</i>")
             if send_telegram("\n".join(lines), dry):
                 sent += 1
                 state["_last_digest"] = now.isoformat()
-                print(f"\n  DIGEST sent ({len(ob)} overbought, {len(os_)} oversold)")
+                print(f"\n  DIGEST sent ({len(ob)} overbought, {len(os_)} oversold, "
+                      f"{len(exp_warn)} exposure warn, {len(corr_warn)} corr warn)")
 
     # ---- Periodic forward-test report ------------------------------------
     if LOG_OUTCOMES:
