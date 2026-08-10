@@ -33,7 +33,7 @@ squeeze filter, and waiting for a better price via a resting limit order -
 see the "TESTED AND NOT ADOPTED" note above quality_score() for why.
 """
 
-import json, os, sys, time, argparse
+import json, os, re, sys, time, argparse
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
@@ -373,13 +373,13 @@ def setup_grade(cloud_pos: str, thick_band: str, rsi_v: float, stoch_v: float) -
         return "", "", 0
     if cloud_pos == "below":
         parts = ["below thick cloud"]
-        if not np.isnan(stoch_v) and stoch_v < 20: parts.append("Stoch<20")
-        if not np.isnan(rsi_v) and rsi_v < 40:     parts.append("RSI<40")
+        if not np.isnan(stoch_v) and stoch_v < 20: parts.append("Stoch below 20")
+        if not np.isnan(rsi_v) and rsi_v < 40:     parts.append("RSI below 40")
         side = 1
     elif cloud_pos == "above":
         parts = ["above thick cloud"]
-        if not np.isnan(stoch_v) and stoch_v > 80: parts.append("Stoch>80")
-        if not np.isnan(rsi_v) and rsi_v > 60:     parts.append("RSI>60")
+        if not np.isnan(stoch_v) and stoch_v > 80: parts.append("Stoch above 80")
+        if not np.isnan(rsi_v) and rsi_v > 60:     parts.append("RSI above 60")
         side = -1
     else:
         return "", "", 0
@@ -638,10 +638,25 @@ def send_telegram(text: str, dry: bool = False) -> bool:
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=20)
-        if r.status_code != 200:
-            print(f"  !! Telegram error {r.status_code}: {r.text[:200]}")
-            return False
-        return True
+        if r.status_code == 200:
+            return True
+        print(f"  !! Telegram error {r.status_code}: {r.text[:200]}")
+        if r.status_code == 400 and "can't parse entities" in r.text:
+            # A malformed <tag> somewhere in the text (stray '<'/'>' from an
+            # f-string, not real HTML) makes Telegram reject the WHOLE message -
+            # the alert silently vanishes rather than arriving ugly. That's a
+            # worse failure than ugly formatting, so retry once as plain text
+            # with the tags stripped instead of trusting parse_mode at all.
+            plain = re.sub(r"<[^>]+>", "", text)
+            r2 = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": plain},
+                timeout=20)
+            if r2.status_code == 200:
+                print("  -> recovered: sent as plain text after HTML parse error")
+                return True
+            print(f"  !! plain-text retry also failed {r2.status_code}: {r2.text[:200]}")
+        return False
     except Exception as e:
         print(f"  !! Telegram send failed: {e}")
         return False
