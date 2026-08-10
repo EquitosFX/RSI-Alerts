@@ -787,13 +787,18 @@ def entry_plan(price: float, atr_v: float, side: int) -> dict | None:
     reward:risk), matching this project's established ATR-entry-plan
     convention.
 
-    IMPORTANT: this is a sizing/planning convenience, not a validated exit
-    rule. Everything backtested in this project (the stack, z-score
-    reversion, Keltner reversion) was validated with a fixed-HORIZON exit
-    (10 or 20 trading days) - nothing here has tested what happens if you
-    exit early at this specific stop or target instead of holding to the
-    horizon. Treat the levels as a reasonable place to put a real order,
-    not as a second, independently-proven signal.
+    IMPORTANT - for z-score/Keltner reversion specifically, this has been
+    TESTED as an early-exit rule and found WORSE than the validated
+    fixed-horizon exit: PF fell from 1.15/1.14 to 0.99/1.03 (see
+    exit_comparison_backtest.py). The stop alone gets hit ~46% of the time,
+    before the slow drift these signals actually run on has room to play
+    out - these are small, patient effects, not fast moves a tight ATR stop
+    is suited to protect. Use the levels for sizing / a real order to place,
+    but hold the full validated horizon rather than exiting early on them.
+
+    For the main cloud/Stoch/RSI stack, this specific question (early exit
+    vs its 10d horizon) has NOT been tested - don't assume the same finding
+    carries over; it's a different signal on a different horizon.
 
     Returns None if atr_v is unusable (NaN) or price is zero/missing -
     never fabricate a level from missing data.
@@ -1158,6 +1163,7 @@ def check_all(dry: bool = False) -> int:
                     plan_r = entry_plan(price, atr_v, side)
                     dirword = "LONG" if side > 0 else "SHORT"
                     pf_note = "1.15" if sig_name == "zscore_rev" else "1.14"
+                    exit_pf_note = "0.99" if sig_name == "zscore_rev" else "1.03"
                     rmsg = (f"{icon} <b>{name}</b> · 1d · {label}\n"
                             f"{dirword} · {price:,.4f}\n"
                             f"🎯 <b>{dirword}</b> · risk {kelly_r['risk_pct']*100:.2f}% "
@@ -1169,8 +1175,10 @@ def check_all(dry: bool = False) -> int:
                                if plan_r else "")
                             + f"ADX {adx_v:.0f} · Chop {chop_v:.0f} · Z {z_v:+.1f}\n"
                             f"<i>Phase 2: pooled/spread-charged/split-half PF {pf_note} on "
-                            f"{REVERSION_HORIZON_DAYS}d daily hold (fixed-horizon exit - the stop/"
-                            f"target above are a sizing convenience, not separately validated). "
+                            f"{REVERSION_HORIZON_DAYS}d daily hold. Stop/target above are for "
+                            f"SIZING ONLY - tested as an early-exit rule and came out worse "
+                            f"(PF {exit_pf_note}; stop alone gets hit ~46% of the time before "
+                            f"the drift has room to play out). Hold the full {REVERSION_HORIZON_DAYS}d. "
                             f"Did NOT clear the held-out H4 check - daily only, does not stack "
                             f"with the other reversion alert.</i>\n"
                             f"<i>{stamp} · closed bar</i>")
