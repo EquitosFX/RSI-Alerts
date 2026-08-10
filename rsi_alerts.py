@@ -97,6 +97,13 @@ MAX_NET_CCY_EXPOSURE  = 2.0     # net same-direction stacked setups on one curre
 CORR_WINDOW           = 20      # bars for the rolling correlation check
 CORR_THRESHOLD        = 0.75    # |rho| above this between two ACTIVE setups gets flagged
 ATR_STOP_MULT         = 2.0     # stop distance used for sizing, in ATR multiples
+ATR_TARGET_MULT       = 3.0     # target distance for the entry-plan line, in ATR multiples
+                                 # (2.0/3.0 = 1.5:1 reward:risk, matching this project's
+                                 # established ATR-entry-plan convention). NOTE: this specific
+                                 # target level has NOT been backtested as an exit rule for any
+                                 # signal here - Phase 2 validated a fixed-HORIZON exit (10/20
+                                 # trading days), not a stop/target exit. Treat the target price
+                                 # as a sizing/planning convenience, not a validated exit signal.
 KELLY_FRACTION        = 0.5     # half-Kelly - full Kelly is well-documented as too aggressive
                                  # given real-world estimation error on a live sample
 MAX_RISK_PCT          = 0.02    # hard cap regardless of what Kelly says
@@ -773,6 +780,35 @@ def kelly_size(tally_entry: dict | None, equity: float = ACCOUNT_EQUITY,
             "notional": round(notional, 2) if notional else None, "basis": basis}
 
 
+def entry_plan(price: float, atr_v: float, side: int) -> dict | None:
+    """
+    Concrete stop and target PRICE levels from ATR - a number to put in an
+    order, not just a risk percentage. Defaults to 2.0/3.0x ATR (1.5:1
+    reward:risk), matching this project's established ATR-entry-plan
+    convention.
+
+    IMPORTANT: this is a sizing/planning convenience, not a validated exit
+    rule. Everything backtested in this project (the stack, z-score
+    reversion, Keltner reversion) was validated with a fixed-HORIZON exit
+    (10 or 20 trading days) - nothing here has tested what happens if you
+    exit early at this specific stop or target instead of holding to the
+    horizon. Treat the levels as a reasonable place to put a real order,
+    not as a second, independently-proven signal.
+
+    Returns None if atr_v is unusable (NaN) or price is zero/missing -
+    never fabricate a level from missing data.
+    """
+    if np.isnan(atr_v) or not price:
+        return None
+    if side > 0:
+        stop, target = price - ATR_STOP_MULT * atr_v, price + ATR_TARGET_MULT * atr_v
+    else:
+        stop, target = price + ATR_STOP_MULT * atr_v, price - ATR_TARGET_MULT * atr_v
+    return {"entry": price, "stop": stop, "target": target,
+            "stop_dist_pct": ATR_STOP_MULT * atr_v / price * 100,
+            "target_dist_pct": ATR_TARGET_MULT * atr_v / price * 100}
+
+
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         try:
@@ -923,14 +959,21 @@ def check_all(dry: bool = False) -> int:
             need_cot_refresh = (now - datetime.fromisoformat(last_cot)) >= timedelta(days=COT_CACHE_DAYS)
         except Exception:
             need_cot_refresh = True
+    wanted = [nm for nm in COT_CONTRACTS if nm in WATCHLIST]
     if need_cot_refresh:
-        for nm, contract in COT_CONTRACTS.items():
-            if nm not in WATCHLIST:
-                continue
-            c = fetch_cot(contract)
+        fetched = 0
+        for nm in wanted:
+            c = fetch_cot(COT_CONTRACTS[nm])
             if c:
                 cot_cache[nm] = c
+                fetched += 1
         state["_cot_last_fetch"] = now.isoformat()
+        print(f"\n  --- COT refresh: {fetched}/{len(wanted)} contracts fetched "
+              f"({', '.join(sorted(cot_cache.keys())) or 'none cached'}) ---")
+    else:
+        age_days = (now - datetime.fromisoformat(last_cot)).days
+        print(f"\n  --- COT refresh skipped (cached {age_days}d ago, refreshes every "
+              f"{COT_CACHE_DAYS}d; {len(cot_cache)}/{len(wanted)} contracts in cache) ---")
 
     for tf in TIMEFRAMES:
         data = fetch_batch(list(WATCHLIST.values()), tf)
@@ -998,11 +1041,13 @@ def check_all(dry: bool = False) -> int:
             # Layer 7 tracking: every live stack this run feeds the portfolio
             # exposure/correlation check that runs once, after the tf loop.
             kelly = None
+            plan = None
             if stack_label:
                 active_setups.append((name, stack_side))
                 tk = f"{stack_tier}|{OUTCOME_HORIZONS[0]}d"
                 stop_pct = (ATR_STOP_MULT * atr_v / price) if not np.isnan(atr_v) and price else None
                 kelly = kelly_size(state.get("_tally", {}).get(tk), stop_pct=stop_pct)
+                plan = entry_plan(price, atr_v, stack_side)
             if tf == "1d":
                 daily_closes[name] = df["Close"]
 
@@ -1014,7 +1059,11 @@ def check_all(dry: bool = False) -> int:
                        f"· Quality {qscore}/5"
                        + (f" · risk {kelly['risk_pct']*100:.2f}% (${kelly['risk_amount']:,.0f})"
                           if kelly else "")
-                       + "\n\n")
+                       + "\n"
+                       + (f"Stop {plan['stop']:,.4f} (-{plan['stop_dist_pct']:.1f}%) · "
+                          f"Target {plan['target']:,.4f} (+{plan['target_dist_pct']:.1f}%)\n"
+                          if plan else "")
+                       + "\n")
 
             # Trend board + cloud + regime, compacted from 4 lines to 2 -
             # same information, faster to scan.
@@ -1106,6 +1155,7 @@ def check_all(dry: bool = False) -> int:
                     tk = f"{sig_name}|{REVERSION_HORIZON_DAYS}d"
                     stop_pct = (ATR_STOP_MULT * atr_v / price) if not np.isnan(atr_v) and price else None
                     kelly_r = kelly_size(state.get("_tally", {}).get(tk), stop_pct=stop_pct)
+                    plan_r = entry_plan(price, atr_v, side)
                     dirword = "LONG" if side > 0 else "SHORT"
                     pf_note = "1.15" if sig_name == "zscore_rev" else "1.14"
                     rmsg = (f"{icon} <b>{name}</b> · 1d · {label}\n"
@@ -1114,10 +1164,15 @@ def check_all(dry: bool = False) -> int:
                             f"(${kelly_r['risk_amount']:,.0f}"
                             + (f", notional ${kelly_r['notional']:,.0f}" if kelly_r['notional'] else "")
                             + f") · <i>{kelly_r['basis']}</i>\n"
-                            f"ADX {adx_v:.0f} · Chop {chop_v:.0f} · Z {z_v:+.1f}\n"
+                            + (f"Stop {plan_r['stop']:,.4f} (-{plan_r['stop_dist_pct']:.1f}%) · "
+                               f"Target {plan_r['target']:,.4f} (+{plan_r['target_dist_pct']:.1f}%)\n"
+                               if plan_r else "")
+                            + f"ADX {adx_v:.0f} · Chop {chop_v:.0f} · Z {z_v:+.1f}\n"
                             f"<i>Phase 2: pooled/spread-charged/split-half PF {pf_note} on "
-                            f"{REVERSION_HORIZON_DAYS}d daily hold. Did NOT clear the held-out "
-                            f"H4 check - daily only, does not stack with the other reversion alert.</i>\n"
+                            f"{REVERSION_HORIZON_DAYS}d daily hold (fixed-horizon exit - the stop/"
+                            f"target above are a sizing convenience, not separately validated). "
+                            f"Did NOT clear the held-out H4 check - daily only, does not stack "
+                            f"with the other reversion alert.</i>\n"
                             f"<i>{stamp} · closed bar</i>")
                     if send_telegram(rmsg, dry):
                         sent += 1
