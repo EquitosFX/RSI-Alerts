@@ -80,7 +80,19 @@ DIGEST_BELOW = 25
 # regime_tag(): never a hard gate on whether an alert fires, because this
 # project already found hard-gating the RSI signal on a second indicator
 # made results worse, not better.
-ACCOUNT_EQUITY        = float(os.environ.get("ACCOUNT_EQUITY") or "10000")  # for $ sizing only
+try:
+    ACCOUNT_EQUITY = float(os.environ.get("ACCOUNT_EQUITY") or "10000")  # for $ sizing only
+except ValueError:
+    # Guards against e.g. the ACCOUNT_EQUITY secret accidentally holding the
+    # literal string "***" - GitHub masks secret VALUES as *** in log output;
+    # if that masked text is ever copied back into the secret field instead
+    # of the real number, this is what gets read at runtime. One bad config
+    # value should never take down the whole bot - see fetch_cot() etc. for
+    # the same never-crash-the-run philosophy applied elsewhere.
+    print(f"  !! ACCOUNT_EQUITY env var isn't a valid number "
+          f"({os.environ.get('ACCOUNT_EQUITY')!r}) - using $10,000 default. "
+          f"Check Settings > Secrets and variables > Actions.")
+    ACCOUNT_EQUITY = 10000.0
 MAX_NET_CCY_EXPOSURE  = 2.0     # net same-direction stacked setups on one currency before warning
 CORR_WINDOW           = 20      # bars for the rolling correlation check
 CORR_THRESHOLD        = 0.75    # |rho| above this between two ACTIVE setups gets flagged
