@@ -1039,6 +1039,15 @@ def check_all(dry: bool = False) -> int:
             except Exception:
                 ku_curr = kl_curr = ku_prev = kl_prev = c_prev = float("nan")
             stack_label, stack_tier, stack_side = setup_grade(cpos, cband, curr, stoch_v)
+            if tf != "1d":
+                # The cloud/Stoch/RSI stack was only ever validated on daily
+                # bars - its own held-out H4 retest already showed the edge
+                # weakening there, and live signal-scorecard results (n=23,
+                # 22/23 on 1h/4h, PF 0.88 vs PF 0.75 on "full stack" 1h/4h
+                # specifically) are consistent with that. Same discipline
+                # already applied to z-score/Keltner reversion: no verdict,
+                # no sizing, no entry plan outside 1d.
+                stack_label, stack_tier, stack_side = "", "", 0
             qscore = quality_score(stack_tier, adx_v, chop_v)
             read = plain_read(stack_side, stack_tier, cpos, cband,
                               curr, stoch_v, adx_v, chop_v, "")
@@ -1114,6 +1123,13 @@ def check_all(dry: bool = False) -> int:
                     events.append(("BELOW", lv))
 
             for direction, lv in events:
+                if not (stack_label and plan):
+                    # No validated trade call attached to this crossing (no
+                    # stack confirmation, or not on 1d where the stack is
+                    # actually validated) - the bot now only sends messages
+                    # that are an actual trade call with a stop and target,
+                    # never a bare RSI reading on its own.
+                    continue
                 key = f"{name}|{tf}|{direction}|{lv}"
                 if state.get(key) == bar_id:
                     continue
@@ -1156,11 +1172,17 @@ def check_all(dry: bool = False) -> int:
                     rkey = f"{name}|{tf}|{sig_name}|{'long' if side > 0 else 'short'}"
                     if state.get(rkey) == bar_id:
                         continue
+                    stop_pct = (ATR_STOP_MULT * atr_v / price) if not np.isnan(atr_v) and price else None
+                    plan_r = entry_plan(price, atr_v, side)
+                    if plan_r is None:
+                        # No valid ATR to build a stop/target from - can't
+                        # alert a trade without one, so skip entirely rather
+                        # than send a message (or track exposure) for a
+                        # call that has no risk levels attached.
+                        continue
                     active_setups.append((name, side))
                     tk = f"{sig_name}|{REVERSION_HORIZON_DAYS}d"
-                    stop_pct = (ATR_STOP_MULT * atr_v / price) if not np.isnan(atr_v) and price else None
                     kelly_r = kelly_size(state.get("_tally", {}).get(tk), stop_pct=stop_pct)
-                    plan_r = entry_plan(price, atr_v, side)
                     dirword = "LONG" if side > 0 else "SHORT"
                     pf_note = "1.15" if sig_name == "zscore_rev" else "1.14"
                     exit_pf_note = "0.99" if sig_name == "zscore_rev" else "1.03"
