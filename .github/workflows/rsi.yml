@@ -1,0 +1,59 @@
+name: RSI alerts
+
+on:
+  schedule:
+    - cron: "7 * * * *"      # hourly, offset off the hour to dodge GitHub congestion
+  workflow_dispatch:
+    inputs:
+      test_message:
+        description: "Send a test Telegram message instead of checking RSI"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Print alerts instead of sending them to Telegram (use this for the first run after any code change)"
+        type: boolean
+        default: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # State lives in the Actions cache, not a git commit, so a run can never
+      # collide with an edit made while it is running.
+      - name: Restore alert state
+        uses: actions/cache/restore@v4
+        with:
+          path: rsi_alert_state.json
+          key: rsi-state-${{ github.run_id }}
+          restore-keys: |
+            rsi-state-
+
+      - name: Install dependencies
+        run: pip install yfinance pandas requests
+
+      - name: Run RSI check
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Optional - defaults to $10,000 if not set. Set this secret (or
+          # switch to a repo Variable if you'd rather it not be a secret)
+          # so Kelly position sizing reflects your real account size.
+          ACCOUNT_EQUITY: ${{ secrets.ACCOUNT_EQUITY }}
+          # Optional - the bot works without it (falls back to a hardcoded
+          # first-Friday-of-the-month approximation for the NFP guardrail).
+          # Free key: https://fred.stlouisfed.org/docs/api/api_key.html
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python rsi_alerts.py ${{ inputs.test_message && '--test-message' || (inputs.dry_run && '--dry-run' || '') }}
+
+      - name: Save alert state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          key: rsi-state-${{ github.run_id }}
+          path: rsi_alert_state.json
