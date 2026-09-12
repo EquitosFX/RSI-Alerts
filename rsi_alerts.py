@@ -160,6 +160,27 @@ COT_CONTRACTS = {
 COT_CACHE_DAYS = 3   # the underlying data only updates weekly - no reason
                       # to re-fetch more often than this
 
+# ---- NFP proximity guardrail (z-score reversion ONLY) ---------------------
+# Phase 2 found z-score reversion specifically underperforms when entered
+# within +/-2 calendar days of an NFP release: PF 1.03 near vs 1.11 far,
+# split-half CONSISTENT in both groups (see signal_vs_nfp.py) - the near
+# figure doesn't even clear this project's own PF 1.10 validation bar.
+# Keltner reversion showed the OPPOSITE (better near NFP, also split-half
+# consistent), so this gate applies ONLY to zscore_rev - never keltner_rev,
+# never the stack.
+#
+# FRED is free and needs its own key (separate signup from anything else
+# here): https://fred.stlouisfed.org/docs/api/api_key.html
+# Falls back to a hardcoded "first Friday of the month" approximation if
+# FRED is unreachable AND no cached dates exist at all - a network hiccup
+# on this must never silently disable or crash the whole bot. NFP shifts
+# off the first Friday only rarely (holiday collisions), so the fallback
+# is a deliberate approximation, not a guess pulled from nowhere.
+FRED_API_KEY   = os.environ.get("FRED_API_KEY", "")
+NFP_WINDOW_DAYS = 2    # matches the tested window exactly - not re-tuned here
+NFP_CACHE_DAYS  = 14   # NFP dates are announced months ahead and don't change -
+                        # no need to refetch often
+
 # ---- Instruments ---------------------------------------------------------
 # Yahoo tickers. Currency pairs use PAIR=X. Metals are futures (=F) because
 # Yahoo does not serve spot XAU/XAG.
@@ -946,6 +967,77 @@ def cot_context(name: str, cache: dict) -> str:
     return f"COT spec {side} {abs(c['net']):,.0f}{pct} {arrow} · {c['date']}"
 
 
+def fetch_nfp_dates_fred(api_key: str) -> list[str] | None:
+    """
+    Real NFP (Employment Situation) release dates from FRED, most recent
+    first. Returns None on ANY failure (no key, network error, bad
+    response) - never raises - so a FRED hiccup falls through to the
+    cache-or-fallback logic in check_all() instead of breaking the run.
+
+    limit=24 (~2 years of monthly releases) is generous on purpose: cheap
+    to fetch, and comfortably covers "is today near a release" regardless
+    of exactly how far into the future FRED's list extends.
+    """
+    if not api_key:
+        return None
+    try:
+        r = requests.get("https://api.stlouisfed.org/fred/series/release",
+                          params={"series_id": "PAYEMS", "api_key": api_key, "file_type": "json"},
+                          timeout=15)
+        r.raise_for_status()
+        releases = r.json().get("releases", [])
+        if not releases:
+            return None
+        release_id = releases[0]["id"]
+        r2 = requests.get("https://api.stlouisfed.org/fred/release/dates",
+                           params={"release_id": release_id, "api_key": api_key,
+                                   "file_type": "json", "limit": 24, "sort_order": "desc"},
+                           timeout=15)
+        r2.raise_for_status()
+        dates = [d["date"] for d in r2.json().get("release_dates", [])]
+        return dates if dates else None
+    except Exception as e:
+        print(f"  !! NFP date fetch from FRED failed: {e}")
+        return None
+
+
+def nfp_dates_fallback(around: datetime, months: int = 2) -> list[str]:
+    """
+    Hardcoded approximation: NFP as the first Friday of the month, for the
+    month of `around` plus a few months either side. Used ONLY when FRED
+    is unreachable and there is no existing cache at all (see check_all())
+    - NFP shifts off the first Friday a few times a year around holidays,
+    so this is a deliberate approximation, not a substitute for the real
+    schedule.
+    """
+    out = []
+    base = around.replace(day=1)
+    for offset in range(-months, months + 1):
+        year = base.year + (base.month - 1 + offset) // 12
+        month = (base.month - 1 + offset) % 12 + 1
+        month_start = datetime(year, month, 1)
+        days_to_friday = (4 - month_start.weekday()) % 7   # Mon=0 ... Fri=4
+        first_friday = month_start + timedelta(days=days_to_friday)
+        out.append(first_friday.strftime("%Y-%m-%d"))
+    return out
+
+
+def is_near_nfp(check_date, nfp_cache: dict) -> bool:
+    """True if check_date is within NFP_WINDOW_DAYS of any date in
+    nfp_cache["dates"] (source: FRED when available, first-Friday
+    approximation otherwise - see the refresh logic in check_all()).
+    Returns False (never gates) if there's no date info at all - missing
+    data should never silently suppress a signal."""
+    dates = nfp_cache.get("dates") or []
+    if not dates:
+        return False
+    check_ts = pd.Timestamp(check_date)
+    for d in dates:
+        if abs((pd.Timestamp(d) - check_ts).days) <= NFP_WINDOW_DAYS:
+            return True
+    return False
+
+
 def check_all(dry: bool = False) -> int:
     state = load_state()
     sent = 0
@@ -979,6 +1071,37 @@ def check_all(dry: bool = False) -> int:
         age_days = (now - datetime.fromisoformat(last_cot)).days
         print(f"\n  --- COT refresh skipped (cached {age_days}d ago, refreshes every "
               f"{COT_CACHE_DAYS}d; {len(cot_cache)}/{len(wanted)} contracts in cache) ---")
+
+    # ---- NFP dates refresh (for the z-score reversion guardrail) ---------
+    nfp_cache = state.setdefault("_nfp_cache", {})
+    last_nfp = state.get("_nfp_last_fetch")
+    need_nfp_refresh = True
+    if last_nfp:
+        try:
+            need_nfp_refresh = (now - datetime.fromisoformat(last_nfp)) >= timedelta(days=NFP_CACHE_DAYS)
+        except Exception:
+            need_nfp_refresh = True
+    if need_nfp_refresh:
+        fetched = fetch_nfp_dates_fred(FRED_API_KEY)
+        if fetched:
+            nfp_cache["dates"] = fetched
+            nfp_cache["source"] = "fred"
+            state["_nfp_last_fetch"] = now.isoformat()
+            print(f"  --- NFP dates refreshed from FRED ({len(fetched)} dates, "
+                  f"most recent {fetched[0]}) ---")
+        elif not nfp_cache.get("dates"):
+            fallback_dates = nfp_dates_fallback(now)
+            nfp_cache["dates"] = fallback_dates
+            nfp_cache["source"] = "fallback"
+            state["_nfp_last_fetch"] = now.isoformat()
+            print(f"  --- NFP dates: FRED unavailable, using first-Friday fallback "
+                  f"({len(fallback_dates)} dates) ---")
+        else:
+            print(f"  --- NFP dates: FRED unavailable, keeping existing "
+                  f"{nfp_cache.get('source', '?')}-sourced cache ---")
+    else:
+        print(f"  --- NFP dates: cached ({nfp_cache.get('source', '?')}), "
+              f"{len(nfp_cache.get('dates', []))} dates on file ---")
 
     for tf in TIMEFRAMES:
         data = fetch_batch(list(WATCHLIST.values()), tf)
@@ -1168,6 +1291,16 @@ def check_all(dry: bool = False) -> int:
                     ("keltner_rev", "〰️", "Keltner reversion", keltrev_short, -1),
                 ]:
                     if not fired:
+                        continue
+                    if sig_name == "zscore_rev" and is_near_nfp(df.index[-2], nfp_cache):
+                        # Validated finding (signal_vs_nfp.py): z-score
+                        # reversion entered within +/-2 days of an NFP
+                        # release scores PF 1.03 vs 1.11 far-from-NFP,
+                        # split-half consistent in both groups - doesn't
+                        # even clear this project's own 1.10 bar. Keltner
+                        # reversion showed the OPPOSITE and is NOT gated.
+                        print(f"  {name}|{tf:<3}  SKIPPED {sig_name} {('long' if side>0 else 'short')} "
+                              f"- within {NFP_WINDOW_DAYS}d of an NFP release")
                         continue
                     rkey = f"{name}|{tf}|{sig_name}|{'long' if side > 0 else 'short'}"
                     if state.get(rkey) == bar_id:
