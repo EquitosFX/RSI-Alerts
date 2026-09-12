@@ -45,6 +45,10 @@ jobs:
           # switch to a repo Variable if you'd rather it not be a secret)
           # so Kelly position sizing reflects your real account size.
           ACCOUNT_EQUITY: ${{ secrets.ACCOUNT_EQUITY }}
+          # Optional - the bot works without it (falls back to a hardcoded
+          # first-Friday-of-the-month approximation for the NFP guardrail).
+          # Free key: https://fred.stlouisfed.org/docs/api/api_key.html
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: python rsi_alerts.py ${{ inputs.test_message && '--test-message' || (inputs.dry_run && '--dry-run' || '') }}
 
       - name: Save alert state
