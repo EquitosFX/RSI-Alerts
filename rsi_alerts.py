@@ -558,6 +558,32 @@ def quality_score(stack_tier: str, adx_v: float, chop_v: float) -> int:
     return base_pts + extra
 
 
+def quality_breakdown(stack_tier: str, adx_v: float, chop_v: float) -> tuple[int, str]:
+    """
+    Same total as quality_score() (computed by calling it, so the two can
+    never disagree) - but also returns a short label revealing the
+    COMPOSITION, because two signals can show the same X/5 while resting
+    on very different evidence. "full stack + 0 bonus" is built entirely
+    from the tested tier (though even the INCREMENTAL value of stacking
+    further confirming factors on top of the single strongest one didn't
+    hold up on the held-out H4 check - see setup_grade()'s docstring).
+    "base + 2 bonus" rests on the single WEAKEST tested tier, propped up
+    by two points that are explicitly unvalidated (see quality_score()'s
+    own caveat above). Same number, very different weight of evidence -
+    shown so the number is never taken at face value.
+    """
+    qscore = quality_score(stack_tier, adx_v, chop_v)
+    if qscore == 0:
+        return 0, ""
+    base_pts = {"base": 1, "stacked": 2, "full stack": 3}.get(stack_tier, 0)
+    bonus = qscore - base_pts
+    tier_label = {"base": "base (weakest tested tier)",
+                  "stacked": "stacked (mid tested tier)",
+                  "full stack": "full stack (strongest tested tier)"}.get(stack_tier, stack_tier)
+    suffix = f"+ {bonus} bonus" if bonus else "+ 0 bonus (no unvalidated padding)"
+    return qscore, f"{tier_label} {suffix}"
+
+
 FIB_LOOKBACK_DAYS = 50
 FIB_RATIOS = [0.236, 0.382, 0.5, 0.618, 0.786]
 FIB_PROXIMITY_TOL_ATR = 0.5
@@ -1252,7 +1278,7 @@ def check_all(dry: bool = False) -> int:
                 # already applied to z-score/Keltner reversion: no verdict,
                 # no sizing, no entry plan outside 1d.
                 stack_label, stack_tier, stack_side = "", "", 0
-            qscore = quality_score(stack_tier, adx_v, chop_v)
+            qscore, qbreak = quality_breakdown(stack_tier, adx_v, chop_v)
             read = plain_read(stack_side, stack_tier, cpos, cband,
                               curr, stoch_v, adx_v, chop_v, "")
 
@@ -1273,8 +1299,8 @@ def check_all(dry: bool = False) -> int:
             # the decision-relevant bit is visible even in a truncated phone
             # notification preview, before the fuller narrative below it.
             verdict = ("" if not stack_label else
-                       f"🎯 <b>{'LONG' if stack_side > 0 else 'SHORT'}</b> · {stack_tier} "
-                       f"· Quality {qscore}/5"
+                       f"🎯 <b>{'LONG' if stack_side > 0 else 'SHORT'}</b> · "
+                       f"Quality {qscore}/5 <i>({qbreak})</i>"
                        + (f" · risk {kelly['risk_pct']*100:.2f}% (${kelly['risk_amount']:,.0f})"
                           if kelly else "")
                        + "\n"
@@ -1315,13 +1341,22 @@ def check_all(dry: bool = False) -> int:
             if cot_line: extra_bits.append(cot_line)
             extra_line = (" · ".join(extra_bits) + "\n") if extra_bits else ""
 
+            qcaveat = ""
+            if stack_label:
+                qcaveat = (f"<i>Quality {qscore}/5 = {qbreak}. The tested tier (base/stacked/"
+                           f"full stack) is the validated part - though even the incremental "
+                           f"value of stacking further factors didn't hold up on the held-out "
+                           f"H4 check. Bonus points (ADX/Chop) are additive context only, not "
+                           f"independently proven, same status as the reversion alerts' "
+                           f"confidence breakdown.</i>\n")
             ctx = ("" if not tag else
                    verdict
                    + f"{read}\n\n"
                    + "🔬 <i>Technical detail (not needed to act on this):</i>\n"
                    + board_line
                    + detail_line + "\n"
-                   + extra_line)
+                   + extra_line
+                   + qcaveat)
 
             if curr >= DIGEST_ABOVE or curr <= DIGEST_BELOW:
                 extended.append((name, tf, curr))
