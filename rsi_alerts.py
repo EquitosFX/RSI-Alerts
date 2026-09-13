@@ -558,6 +558,68 @@ def quality_score(stack_tier: str, adx_v: float, chop_v: float) -> int:
     return base_pts + extra
 
 
+FIB_LOOKBACK_DAYS = 50
+FIB_RATIOS = [0.236, 0.382, 0.5, 0.618, 0.786]
+FIB_PROXIMITY_TOL_ATR = 0.5
+
+def fib_proximity(df: pd.DataFrame, atr_v: float) -> bool:
+    """
+    Whether the last CLOSED bar's price sits within 0.5x ATR of any
+    Fibonacci retracement level (23.6/38.2/50/61.8/78.6%) of the trailing
+    50-day swing high-to-low range. Same lookback, ratios, and tolerance
+    as ma_fib_confluence_test.py - not re-tuned for live use.
+
+    VALIDATED specifically for z-score and Keltner reversion entries:
+    near-level entries showed a real, split-half-consistent PF and return
+    edge over far entries in BOTH signal types independently (z-score
+    n=3054, PF 1.14 vs 1.08; Keltner n=970, PF 1.12 vs 1.06). This is the
+    one factor in reversion_confidence() below that has actually cleared
+    this project's bar, not just been shown as unvalidated context.
+    """
+    if np.isnan(atr_v) or len(df) < 3:
+        return False
+    i = len(df) - 2   # last closed bar
+    lo_start = max(0, i - FIB_LOOKBACK_DAYS)
+    window_high = df["High"].iloc[lo_start:i + 1]
+    window_low = df["Low"].iloc[lo_start:i + 1]
+    if window_high.empty:
+        return False
+    swing_high, swing_low = float(window_high.max()), float(window_low.min())
+    if swing_high <= swing_low:
+        return False
+    price = float(df["Close"].iloc[i])
+    levels = [swing_low + f * (swing_high - swing_low) for f in FIB_RATIOS]
+    return any(abs(price - lv) <= FIB_PROXIMITY_TOL_ATR * atr_v for lv in levels)
+
+
+def reversion_confidence(adx_v: float, chop_v: float, fib_ok: bool) -> tuple[int, int, str]:
+    """
+    A 0-100% confidence read for reversion alerts (zscore_rev/keltner_rev),
+    which otherwise show no at-a-glance quality signal at all - unlike the
+    stack, which has quality_score(). Three factors, each worth a third:
+
+      Fibonacci proximity  - VALIDATED (see fib_proximity() above)
+      ADX >= 25             - additive context only, same UNVALIDATED-as-
+      Chop < 38              a-gate status as in quality_score() - tested
+                              as a hard filter elsewhere in this project
+                              and made results worse, not better.
+
+    Read this the same way quality_score()'s docstring asks: more of the
+    three lining up is "more context agrees," not "objectively more
+    likely to win" - only the Fibonacci third of this has actually earned
+    that claim. Doesn't touch or extend the stack's own quality_score(),
+    since Fibonacci proximity was validated on reversion entries
+    specifically, not on stack entries - a different, untested question.
+    """
+    checks = [("Fibonacci level", fib_ok),
+              ("ADX trending", not np.isnan(adx_v) and adx_v >= 25),
+              ("Chop directional", not np.isnan(chop_v) and chop_v < 38)]
+    hits = sum(1 for _, ok in checks if ok)
+    pct = round(hits / len(checks) * 100)
+    breakdown = " · ".join(f"{name} {'✓' if ok else '✗'}" for name, ok in checks)
+    return pct, hits, breakdown
+
+
 def board_note(votes: int) -> str:
     """
     What the four-indicator board actually implies, which is the opposite of
@@ -1357,6 +1419,8 @@ def check_all(dry: bool = False) -> int:
                     dirword = "LONG" if side > 0 else "SHORT"
                     pf_note = "1.15" if sig_name == "zscore_rev" else "1.14"
                     exit_pf_note = "0.99" if sig_name == "zscore_rev" else "1.03"
+                    fib_ok = fib_proximity(df, atr_v)
+                    conf_pct, conf_hits, conf_breakdown = reversion_confidence(adx_v, chop_v, fib_ok)
                     rmsg = (f"{icon} <b>{name}</b> · 1d · {label}\n"
                             f"{dirword} · {price:,.4f}\n"
                             f"🎯 <b>{dirword}</b> · risk {kelly_r['risk_pct']*100:.2f}% "
@@ -1366,6 +1430,8 @@ def check_all(dry: bool = False) -> int:
                             + (f"Stop {plan_r['stop']:,.4f} (-{plan_r['stop_dist_pct']:.1f}%) · "
                                f"Target {plan_r['target']:,.4f} (+{plan_r['target_dist_pct']:.1f}%)\n"
                                if plan_r else "")
+                            + f"✅ <b>Confidence: {conf_pct}%</b> <i>({conf_hits}/3 confirming "
+                              f"factors align - see breakdown below)</i>\n"
                             + f"📖 <b>READ:</b> price has moved unusually far from its recent "
                               f"average - this has historically drifted back over about a "
                               f"month. <b>Hold the full {REVERSION_HORIZON_DAYS} days</b> - "
@@ -1378,6 +1444,13 @@ def check_all(dry: bool = False) -> int:
                             f"time before the drift has room to play out). Didn't clear the "
                             f"held-out H4 check - daily only, doesn't stack with the other "
                             f"reversion alert.</i>\n"
+                            f"<i>Confidence breakdown: {conf_breakdown}. Fibonacci proximity is "
+                            f"genuinely validated (real, split-half-consistent edge on both "
+                            f"reversion signals). ADX/Chop are shown as additional context only, "
+                            f"same as elsewhere in this bot - not independently proven as a gate, "
+                            f"and tested worse when used as one on an earlier version of this "
+                            f"signal. More checks aligning means more context agrees, not "
+                            f"an objectively higher win chance.</i>\n"
                             f"ADX {adx_v:.0f} · Chop {chop_v:.0f} · Z {z_v:+.1f}\n"
                             f"<i>{stamp} · closed bar</i>")
                     if send_telegram(rmsg, dry):
@@ -1450,7 +1523,7 @@ def check_all(dry: bool = False) -> int:
                             current_price = float(d2m["Close"].iloc[-2])
                             unrealized = (current_price / rec["price"] - 1) * 100 * side_m
                             elapsed_frac = (now - created) / (due - created)
-                            days_elapsed = round(elapsed_frac * rec["h"])
+                            days_elapsed = min(round(elapsed_frac * rec["h"]), rec["h"] - 1)
                             days_left = max(rec["h"] - days_elapsed, 0)
                             dirword_m = "LONG" if side_m > 0 else "SHORT"
                             mid_msg = (f"📊 <b>Halfway check-in: {rec['pair']} {dirword_m}</b>\n"
