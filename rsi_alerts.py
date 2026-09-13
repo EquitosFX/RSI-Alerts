@@ -55,8 +55,28 @@ DIGEST_EVERY_HOURS = 4
 # genuine forward-test data instead of re-slicing history. Nothing here has
 # been fitted to these observations - that is the entire point.
 LOG_OUTCOMES = True
-OUTCOME_HORIZONS = [10, 20]        # trading days to score at
+OUTCOME_HORIZONS = [10, 20]        # trading days to score the STACK signal at.
+                                     # Only [0] (10d) is the real, validated horizon -
+                                     # it drives Kelly sizing and the "time to close"
+                                     # reminder. [1] (20d) is exploratory only: logged
+                                     # to the tally for research, never sized, never
+                                     # reminded on. Don't confuse this with
+                                     # REVERSION_HORIZON_DAYS below (also 20) - that
+                                     # one IS the real, live-traded reversion hold.
 OUTCOME_REPORT_EVERY_DAYS = 30     # send a summary this often
+
+# FX has no single universal "market close" the way stocks do, but most
+# data feeds (and this bot's own daily bars) roll the trading day over
+# around 5pm New York time - 21:00 UTC in winter (EST), 22:00 UTC in
+# summer (EDT). A 3-hour window spanning both covers the DST shift without
+# needing to track it explicitly. The final "time to close" reminder waits
+# for this window even once its horizon is technically due, so it arrives
+# at roughly the same time every day instead of at whatever hour the cron
+# happened to run after the countdown elapsed. The midpoint check-in is
+# NOT windowed - it's informational only, not an action point, so its
+# exact timing matters far less.
+CLOSE_WINDOW_START_UTC = 20
+CLOSE_WINDOW_END_UTC = 23
 
 # Append a short plain-English explainer to every alert. Off by default now
 # that the wording ("leans") is familiar - flip back to True any time you
@@ -600,32 +620,31 @@ def plain_read(side: int, tier: str, cloud_pos: str, band: str,
     else:                            regime = "no clear regime"
 
     if side > 0:
-        strength = {"full stack": "the strongest setup measured",
-                    "stacked":    "a moderately supported setup",
-                    "base":       "a weakly supported setup"}.get(tier, "")
-        return (f"📖 <b>READ — leans UP.</b> Stretched low inside a thick cloud: "
-                f"{strength}. Over the next 10–20 days this configuration has "
-                f"historically drifted higher. The trend board below reads bearish, "
-                f"and on FX that is the favourable side, not a contradiction. "
-                f"Context: {regime}.")
+        strength = {"full stack": "the strongest version of this setup, by what's been tested",
+                    "stacked":    "a moderately-supported version",
+                    "base":       "a weakly-supported version"}.get(tier, "")
+        return (f"📖 <b>READ — leans UP.</b> Price has dropped sharply while still inside "
+                f"a well-established trend zone (the cloud) — {strength}. Setups like this "
+                f"have historically drifted higher over the next 10–20 days. ({regime.capitalize()}.)")
     if side < 0:
-        strength = {"full stack": "the mirror of the strongest setup",
-                    "stacked":    "a moderately supported setup",
-                    "base":       "a weakly supported setup"}.get(tier, "")
-        return (f"📖 <b>READ — leans DOWN.</b> Stretched high inside a thick cloud: "
-                f"{strength}. The short side tested positive but weaker than the "
-                f"long side and did not reach significance. Context: {regime}.")
+        strength = {"full stack": "the mirror-image of the strongest setup measured",
+                    "stacked":    "a moderately-supported version",
+                    "base":       "a weakly-supported version"}.get(tier, "")
+        return (f"📖 <b>READ — leans DOWN.</b> Price has risen sharply while still inside "
+                f"a well-established trend zone (the cloud) — {strength}. Historically this "
+                f"has drifted lower, though the short side tested weaker than the long side "
+                f"and didn't reach significance on its own. ({regime.capitalize()}.)")
 
     # No cloud flag: say so plainly rather than manufacturing a view.
     where = {"above": "above the cloud", "below": "below the cloud",
              "inside": "inside the cloud"}.get(cloud_pos, "")
     if cloud_pos == "inside":
-        return (f"📖 <b>READ — no lean.</b> Price is {where}, which measured as "
-                f"consolidation: smaller moves than usual follow. RSI is stretched "
-                f"but nothing here has a measured direction. Context: {regime}.")
-    return (f"📖 <b>READ — no lean.</b> RSI is stretched, but price is {where} and "
-            f"the cloud is {band} — the conditions that measured anything are absent. "
-            f"Treat as awareness only. Context: {regime}.")
+        return (f"📖 <b>READ — no lean.</b> Price is {where} (consolidating) — smaller "
+                f"moves than usual tend to follow. RSI is stretched, but nothing here "
+                f"points a direction. ({regime.capitalize()}.)")
+    return (f"📖 <b>READ — no lean.</b> RSI is stretched, but price is {where} and the "
+            f"cloud is {band} — the conditions that give this signal its edge aren't "
+            f"present right now. Treat as background awareness only. ({regime.capitalize()}.)")
 
 
 # ==========================================================================
@@ -1207,11 +1226,29 @@ def check_all(dry: bool = False) -> int:
             board_line = ""
             if dirline:
                 note = board_note(votes)
-                board_line = dirline + (f" · <i>{note}</i>" if note else "") + "\n"
-            detail_line = (f"{cloud} · " if cloud else "") + f"ADX {adx_v:.0f} · Chop {chop_v:.0f} · <i>{tag}</i>"
+                board_line = (dirline + (f" · <i>{note}</i>" if note else "") + "\n"
+                              + "<i>  ↳ 4 trend reads: EMA=price vs its 50-day average · "
+                                "MACD=momentum vs its own signal line · "
+                                "SAR=stop-and-reverse dots · DI=directional strength (part of ADX)</i>\n")
+
+            direction_word = {"+DI": "up", "-DI": "down", "?": "n/a"}.get(dir_v, "n/a")
+            cloud_note = ""
+            if cloud:
+                pos_word = cloud.split()[1] if len(cloud.split()) > 1 else ""
+                band_word = cloud.split("(")[1].split(")")[0] if "(" in cloud else ""
+                cloud_note = (f"{cloud} — price is {pos_word} the Ichimoku trend zone "
+                              f"({band_word}-thickness)\n")
+            detail_line = (cloud_note
+                            + f"ADX {adx_v:.0f} <i>(trend strength, 0-100)</i> · "
+                              f"Chop {chop_v:.0f} <i>(choppiness, 0-100 - lower means a real "
+                              f"move is underway)</i> · direction: {direction_word} · <i>{tag}</i>")
             extra_bits = []
-            if not np.isnan(z_v):  extra_bits.append(f"Z {z_v:+.1f}")
-            if not np.isnan(hv_v): extra_bits.append(f"HVpct {hv_v:.0f}")
+            if not np.isnan(z_v):
+                extra_bits.append(f"Z {z_v:+.1f} <i>(std. deviations from its 20-day average)</i>")
+            if not np.isnan(hv_v):
+                vol_read = "unusually volatile" if hv_v >= 80 else "unusually calm" if hv_v <= 20 else "normal range"
+                extra_bits.append(f"HVpct {hv_v:.0f} <i>(today's volatility is higher than "
+                                   f"{hv_v:.0f}% of the past year - {vol_read})</i>")
             cot_line = cot_context(name, cot_cache)
             if cot_line: extra_bits.append(cot_line)
             extra_line = (" · ".join(extra_bits) + "\n") if extra_bits else ""
@@ -1219,6 +1256,7 @@ def check_all(dry: bool = False) -> int:
             ctx = ("" if not tag else
                    verdict
                    + f"{read}\n\n"
+                   + "🔬 <i>Technical detail (not needed to act on this):</i>\n"
                    + board_line
                    + detail_line + "\n"
                    + extra_line)
@@ -1234,7 +1272,7 @@ def check_all(dry: bool = False) -> int:
                         continue
                     pend.append({"key": key, "pair": name, "ticker": ticker, "tf": tf,
                                  "cond": stack_tier, "side": stack_side,
-                                 "price": price, "h": hz,
+                                 "price": price, "h": hz, "created": now.isoformat(),
                                  "due": (now + timedelta(days=int(hz*1.45))).isoformat()})
 
             events = []
@@ -1328,14 +1366,19 @@ def check_all(dry: bool = False) -> int:
                             + (f"Stop {plan_r['stop']:,.4f} (-{plan_r['stop_dist_pct']:.1f}%) · "
                                f"Target {plan_r['target']:,.4f} (+{plan_r['target_dist_pct']:.1f}%)\n"
                                if plan_r else "")
-                            + f"ADX {adx_v:.0f} · Chop {chop_v:.0f} · Z {z_v:+.1f}\n"
-                            f"<i>Phase 2: pooled/spread-charged/split-half PF {pf_note} on "
-                            f"{REVERSION_HORIZON_DAYS}d daily hold. Stop/target above are for "
-                            f"SIZING ONLY - tested as an early-exit rule and came out worse "
-                            f"(PF {exit_pf_note}; stop alone gets hit ~46% of the time before "
-                            f"the drift has room to play out). Hold the full {REVERSION_HORIZON_DAYS}d. "
-                            f"Did NOT clear the held-out H4 check - daily only, does not stack "
-                            f"with the other reversion alert.</i>\n"
+                            + f"📖 <b>READ:</b> price has moved unusually far from its recent "
+                              f"average - this has historically drifted back over about a "
+                              f"month. <b>Hold the full {REVERSION_HORIZON_DAYS} days</b> - "
+                              f"exiting early at the stop/target above tested worse, even if "
+                              f"price dips first.\n"
+                            f"🔬 <i>Why we trust this: pooled/spread-charged/split-half PF "
+                            f"{pf_note} on {REVERSION_HORIZON_DAYS}d daily hold. The stop/target "
+                            f"above are for sizing only - tested as an early-exit rule and came "
+                            f"out worse (PF {exit_pf_note}; the stop alone gets hit ~46% of the "
+                            f"time before the drift has room to play out). Didn't clear the "
+                            f"held-out H4 check - daily only, doesn't stack with the other "
+                            f"reversion alert.</i>\n"
+                            f"ADX {adx_v:.0f} · Chop {chop_v:.0f} · Z {z_v:+.1f}\n"
                             f"<i>{stamp} · closed bar</i>")
                     if send_telegram(rmsg, dry):
                         sent += 1
@@ -1347,7 +1390,7 @@ def check_all(dry: bool = False) -> int:
                         if not any(r.get("key") == pkey for r in pend):
                             pend.append({"key": pkey, "pair": name, "ticker": ticker, "tf": tf,
                                          "cond": sig_name, "side": side, "price": price,
-                                         "h": REVERSION_HORIZON_DAYS,
+                                         "h": REVERSION_HORIZON_DAYS, "created": now.isoformat(),
                                          "due": (now + timedelta(days=int(REVERSION_HORIZON_DAYS*1.45))).isoformat()})
 
             if not events:
@@ -1382,14 +1425,61 @@ def check_all(dry: bool = False) -> int:
                 due = datetime.fromisoformat(rec["due"])
             except Exception:
                 continue
+            # Same "does this record actually notify the user" rule used for
+            # the final close-out reminder below - the stack's secondary 20d
+            # research horizon gets neither a midpoint check-in nor a final
+            # reminder, just silent tallying, so the two stay consistent.
+            is_reversion_signal = rec["cond"] in ("zscore_rev", "keltner_rev")
+            is_primary_stack_horizon = (not is_reversion_signal) and rec["h"] == OUTCOME_HORIZONS[0]
+            notifies = is_reversion_signal or is_primary_stack_horizon
+
             if now < due:
+                if notifies and not rec.get("midpoint_sent"):
+                    try:
+                        created = datetime.fromisoformat(rec["created"])
+                    except Exception:
+                        # older pending record from before "created" was tracked -
+                        # reconstruct it the same way it would have been computed
+                        created = due - timedelta(days=int(rec["h"] * 1.45))
+                    midpoint = created + (due - created) / 2
+                    if now >= midpoint:
+                        dfm = fetch_batch([rec["ticker"]], rec["tf"])
+                        d2m = dfm.get(rec["ticker"])
+                        if d2m is not None and not d2m.empty:
+                            side_m = rec.get("side", 1)
+                            current_price = float(d2m["Close"].iloc[-2])
+                            unrealized = (current_price / rec["price"] - 1) * 100 * side_m
+                            elapsed_frac = (now - created) / (due - created)
+                            days_elapsed = round(elapsed_frac * rec["h"])
+                            days_left = max(rec["h"] - days_elapsed, 0)
+                            dirword_m = "LONG" if side_m > 0 else "SHORT"
+                            mid_msg = (f"📊 <b>Halfway check-in: {rec['pair']} {dirword_m}</b>\n"
+                                       f"{rec['cond']} · day {days_elapsed} of {rec['h']} "
+                                       f"({days_left} to go)\n"
+                                       f"Entry {rec['price']:,.4f} → now {current_price:,.4f}\n"
+                                       f"<b>Unrealized: {unrealized:+.2f}%</b>\n\n"
+                                       f"<i>Just a check-in, not an action - the validated "
+                                       f"exit is still at day {rec['h']}, not now.</i>")
+                            if send_telegram(mid_msg, dry):
+                                sent += 1
+                            rec["midpoint_sent"] = True
                 still.append(rec); continue
+
+            # Due, but wait for the close window so scoring/reminders happen
+            # at a consistent time of day rather than whatever hour the
+            # cron happened to run after the countdown elapsed. Applies to
+            # every due record, not just ones that notify the user, so the
+            # internal tally stays close-to-close consistently too.
+            if not (CLOSE_WINDOW_START_UTC <= now.hour < CLOSE_WINDOW_END_UTC):
+                still.append(rec); continue
+
             df = fetch_batch([rec["ticker"]], rec["tf"])
             d2 = df.get(rec["ticker"])
             if d2 is None or d2.empty:
                 still.append(rec); continue
             side = rec.get("side", 1)
-            ret = (float(d2["Close"].iloc[-2]) / rec["price"] - 1) * 100 * side
+            exit_price = float(d2["Close"].iloc[-2])
+            ret = (exit_price / rec["price"] - 1) * 100 * side
             k = f"{rec['cond']}|{rec['h']}d"
             t = tally.setdefault(k, {"n": 0, "sum": 0.0, "wins": 0,
                                      "long_n": 0, "long_w": 0, "short_n": 0, "short_w": 0,
@@ -1413,6 +1503,33 @@ def check_all(dry: bool = False) -> int:
             t["worst"] = ret if t["worst"] is None else min(t["worst"], ret)
             print(f"  SCORED {rec['pair']} {rec['cond']} {rec['h']}d "
                   f"{'long' if side>0 else 'short'} -> {ret:+.2f}%")
+
+            # ---- Per-trade "time to close" reminder --------------------------
+            # Validated finding (exit_comparison_backtest.py, exit_width_sweep.py):
+            # fixed-horizon holding beats stop/target exit at EVERY width tested,
+            # not just the original one - so the right action here is always
+            # "close now", regardless of where price sits vs the stop/target
+            # shown in the original alert. Only fires for the PRIMARY validated
+            # horizon per signal type - the stack's secondary 20d research
+            # horizon (OUTCOME_HORIZONS[1]) is tallied above but doesn't also
+            # send a second, redundant reminder for the same original trade.
+            # (notifies was already computed above, same rule as the midpoint check.)
+            if notifies:
+                entry_date_approx = due - timedelta(days=int(rec["h"] * 1.45))
+                dirword = "LONG" if side > 0 else "SHORT"
+                remind_msg = (f"⏰ <b>Time to close: {rec['pair']} {dirword}</b>\n"
+                              f"{rec['cond']} · entered ~{entry_date_approx.strftime('%Y-%m-%d')} "
+                              f"({rec['h']} trading days ago) at {rec['price']:,.4f}\n"
+                              f"Exit price now: {exit_price:,.4f} <i>(today's close)</i>\n"
+                              f"<b>Result: {ret:+.2f}%</b>\n\n"
+                              f"<i>This is the validated exit point - close now regardless of "
+                              f"where price sits versus the stop/target shown in the original "
+                              f"alert. Exiting early OR holding past this point both tested "
+                              f"worse than closing exactly here. This message is timed to "
+                              f"arrive near each day's close (~5pm New York time), not at a "
+                              f"random hour.</i>")
+                if send_telegram(remind_msg, dry):
+                    sent += 1
         state["_pending"] = still
 
     # ---- Periodic digest of standing conditions --------------------------
@@ -1427,7 +1544,9 @@ def check_all(dry: bool = False) -> int:
         if due:
             ob = sorted([e for e in extended if e[2] >= DIGEST_ABOVE], key=lambda x: -x[2])
             os_ = sorted([e for e in extended if e[2] <= DIGEST_BELOW], key=lambda x: x[2])
-            lines = [f"📊 <b>Currently extended</b>", ""]
+            lines = [f"📊 <b>Currently extended</b>",
+                     "<i>Background only - not new trade alerts, just which pairs have an "
+                     "unusually stretched RSI reading right now.</i>", ""]
             if ob:
                 lines.append("<b>Overbought (RSI ≥ 70)</b>")
                 lines += [f"  {n} · {t} · <b>{v:.1f}</b>" for n, t, v in ob]
@@ -1440,12 +1559,19 @@ def check_all(dry: bool = False) -> int:
                 # Standing snapshot every time the digest fires, not just
                 # when something crosses MAX_NET_CCY_EXPOSURE - context,
                 # never a gate.
-                lines.append("<b>📐 Portfolio snapshot</b> (Layer 7 — context, not a gate)")
+                lines.append("<b>📐 Portfolio snapshot</b> <i>(context - never blocks a trade)</i>")
+                lines.append("<i>Net exposure per currency across every currently-active setup: "
+                              "positive = net long that currency, negative = net short. A bigger "
+                              "number means several open trades are really the same underlying "
+                              "bet, not genuine diversification, even if they're on different pairs.</i>")
                 warn_ccys = {w.split(":")[0] for w in exp_warn}
-                lines += [f"  {c}: {v:+.1f}" + (" ⚠️" if c in warn_ccys else "")
+                lines += [f"  {c}: {v:+.1f}" + (" ⚠️ several trades, same bet" if c in warn_ccys else "")
                           for c, v in top_exposure]
                 if corr_warn:
-                    lines += [f"  ρ {w}" for w in corr_warn]
+                    lines.append("<i>ρ (correlation) = how closely two currently-active pairs have "
+                                  "moved together over the last 20 days. Near +1 or -1 means holding "
+                                  "both isn't really two separate bets, even with no shared currency.</i>")
+                    lines += [f"  {w}" for w in corr_warn]
                 lines.append("")
             lines.append(f"<i>{stamp} · standing conditions, not new crossings</i>")
             if send_telegram("\n".join(lines), dry):
