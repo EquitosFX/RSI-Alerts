@@ -130,6 +130,37 @@ MAX_RISK_PCT          = 0.02    # hard cap regardless of what Kelly says
 MIN_TRADES_FOR_KELLY  = 50      # below this the tally is noise, not edge - see kelly_from_tally()
 DEFAULT_RISK_PCT      = 0.005   # fixed, conservative fallback while the sample builds
 
+# ---- Real account tracking (compounding Kelly sizing) --------------------
+# Opt-in: set STARTING_BALANCE to activate. Until a real balance exists in
+# state, sizing falls back to the static ACCOUNT_EQUITY default exactly as
+# before - this only changes behavior once explicitly turned on.
+ACCOUNT_CURRENCY = os.environ.get("ACCOUNT_CURRENCY", "GBP")
+_starting_balance_env = os.environ.get("STARTING_BALANCE")
+STARTING_BALANCE = float(_starting_balance_env) if _starting_balance_env else None
+
+# Standard contract size per instrument (units of base currency per 1.0 lot),
+# used to convert a £/$ notional into an actual lot count. DXY excluded
+# deliberately - it's a synthetic basket, not a bilateral pair, and was
+# never part of the validated reversion signal universe anyway.
+CONTRACT_SIZE = {
+    "EURUSD": 100_000, "GBPUSD": 100_000, "USDJPY": 100_000, "USDCHF": 100_000,
+    "USDCAD": 100_000, "AUDUSD": 100_000, "NZDUSD": 100_000,
+    "EURGBP": 100_000, "EURJPY": 100_000, "EURCHF": 100_000, "EURCAD": 100_000,
+    "EURAUD": 100_000, "EURNZD": 100_000,
+    "GBPJPY": 100_000, "GBPCHF": 100_000, "GBPCAD": 100_000, "GBPAUD": 100_000, "GBPNZD": 100_000,
+    "AUDJPY": 100_000, "AUDCHF": 100_000, "AUDCAD": 100_000, "AUDNZD": 100_000,
+    "NZDJPY": 100_000, "NZDCHF": 100_000, "NZDCAD": 100_000,
+    "CADJPY": 100_000, "CADCHF": 100_000, "CHFJPY": 100_000,
+    "GOLD": 100, "SILVER": 5000,   # standard oz-per-lot conventions
+}
+
+# Correlation-aware sizing: how much to scale DOWN risk_pct per unit of
+# overlap with what's ALREADY open, not just warn about it after the fact.
+CORR_SIZE_SCALE_PER_HIT = 0.7   # multiply risk by this for each correlated
+                                 # open position found, floor below
+CORR_SIZE_FLOOR = 0.25          # never scale a trade down below this fraction
+                                 # of its original Kelly-derived size
+
 # ---- Extra context: z-score / HV percentile -------------------------------
 # Phase 1 survey candidates (z-score mean reversion, historical-volatility
 # percentile) - pure OHLC, nothing new to fetch. UNVALIDATED on this project;
@@ -762,6 +793,145 @@ def currency_legs(name: str) -> tuple[str, str] | None:
     return None
 
 
+def live_conversion_rates(data: dict) -> dict:
+    """Derive CURRENT quote-currency-to-ACCOUNT_CURRENCY rates from this
+    run's already-fetched major pairs, rather than a hardcoded static
+    table that goes stale. Returns whatever it could compute - missing
+    majors just mean some quote currencies won't convert this run, never
+    a crash or a fabricated rate."""
+    def last_close(ticker):
+        df = data.get(ticker)
+        if df is None or df.empty or len(df) < 2:
+            return None
+        v = df["Close"].iloc[-2]   # last CLOSED bar, matching convention throughout
+        return float(v) if not np.isnan(v) else None
+
+    eurusd = last_close("EURUSD=X")
+    gbpusd = last_close("GBPUSD=X")
+    usdjpy = last_close("USDJPY=X")
+    usdchf = last_close("USDCHF=X")
+    usdcad = last_close("USDCAD=X")
+    audusd = last_close("AUDUSD=X")
+    nzdusd = last_close("NZDUSD=X")
+
+    to_usd = {"USD": 1.0}
+    if usdjpy: to_usd["JPY"] = 1 / usdjpy
+    if usdchf: to_usd["CHF"] = 1 / usdchf
+    if usdcad: to_usd["CAD"] = 1 / usdcad
+    if gbpusd: to_usd["GBP"] = gbpusd
+    if audusd: to_usd["AUD"] = audusd
+    if nzdusd: to_usd["NZD"] = nzdusd
+    if eurusd: to_usd["EUR"] = eurusd
+
+    usd_to_account = None
+    if ACCOUNT_CURRENCY == "USD":
+        usd_to_account = 1.0
+    elif ACCOUNT_CURRENCY in to_usd and to_usd[ACCOUNT_CURRENCY]:
+        usd_to_account = 1 / to_usd[ACCOUNT_CURRENCY]
+    return {"to_usd": to_usd, "usd_to_account": usd_to_account}
+
+
+def notional_to_lots(inst: str, price: float, notional_account_ccy: float,
+                      rates: dict) -> float | None:
+    """Convert a notional position VALUE (in ACCOUNT_CURRENCY) into an
+    actual lot count for this instrument's real contract size. Returns
+    None - never a guessed number - if the contract size or the needed
+    conversion rate isn't available (e.g. DXY, or a major failed to fetch
+    this run)."""
+    if inst not in CONTRACT_SIZE or not notional_account_ccy or not price:
+        return None
+    legs = currency_legs(inst)
+    if legs is None:
+        return None
+    quote = legs[1]
+    if quote not in rates["to_usd"] or not rates.get("usd_to_account"):
+        return None
+    value_per_lot = CONTRACT_SIZE[inst] * price * rates["to_usd"][quote] * rates["usd_to_account"]
+    if value_per_lot <= 0:
+        return None
+    return notional_account_ccy / value_per_lot
+
+
+def open_position_risk_scale(inst: str, side: int, pending: list, daily_closes: dict) -> tuple[float, str]:
+    """
+    Scales DOWN a new trade's risk_pct based on what's ALREADY open right
+    now (state["_pending"], genuinely unresolved positions - not just
+    "flagged this run"), instead of only warning about overlap after the
+    fact the way exposure_warnings()/correlation_warnings() do for the
+    digest. Two things are checked:
+
+      1. Currency exposure: would adding this trade push net exposure on
+         either of its currency legs to/past MAX_NET_CCY_EXPOSURE? If so,
+         scale down proportionally.
+      2. Correlation: for each ALREADY-OPEN position on a different
+         instrument whose rolling correlation with this one is >=
+         CORR_THRESHOLD AND which is a same-direction bet (moves the same
+         way as this proposed trade), multiply risk by
+         CORR_SIZE_SCALE_PER_HIT - compounding for multiple hits, floored
+         at CORR_SIZE_FLOOR so a position is reduced, never zeroed out
+         silently.
+
+    Returns (scale_factor, reason_str). scale_factor=1.0 means no
+    reduction was needed.
+    """
+    if not pending:
+        return 1.0, ""
+
+    open_by_inst: dict[str, int] = {}
+    for rec in pending:
+        open_by_inst[rec["pair"]] = open_by_inst.get(rec["pair"], 0) + rec.get("side", 1)
+
+    reasons = []
+    scale = 1.0
+
+    # --- currency exposure check ---
+    legs = currency_legs(inst)
+    if legs is not None:
+        active = [(p, s) for p, s in open_by_inst.items()] + [(inst, side)]
+        net = net_currency_exposure(active)
+        base, quote = legs
+        for ccy in (base, quote):
+            projected = net.get(ccy, 0.0)
+            if abs(projected) > MAX_NET_CCY_EXPOSURE:
+                ccy_scale = MAX_NET_CCY_EXPOSURE / abs(projected)
+                scale = min(scale, ccy_scale)
+                reasons.append(f"{ccy} exposure would reach {projected:+.1f}")
+
+    # --- correlation check against each already-open instrument ---
+    hits = 0
+    if inst in daily_closes:
+        for other_inst, other_side in open_by_inst.items():
+            if other_inst == inst or other_inst not in daily_closes:
+                continue
+            pair_df = pd.DataFrame({inst: daily_closes[inst], other_inst: daily_closes[other_inst]}).dropna()
+            if len(pair_df) < CORR_WINDOW:
+                continue
+            rho = np.log(pair_df).diff().dropna().tail(CORR_WINDOW).corr().iloc[0, 1]
+            if pd.isna(rho):
+                continue
+            same_direction_bet = (rho >= CORR_THRESHOLD and side == other_side) or \
+                                  (rho <= -CORR_THRESHOLD and side != other_side)
+            if same_direction_bet:
+                hits += 1
+                reasons.append(f"correlated with open {other_inst} (ρ={rho:+.2f})")
+
+    if hits:
+        corr_scale = CORR_SIZE_SCALE_PER_HIT ** hits
+        scale = min(scale, corr_scale)
+
+    # Floor applies to the FINAL combined scale (currency exposure AND
+    # correlation together) - a position is reduced for overlap, never
+    # crushed toward zero by the two reductions compounding on each other.
+    # (Bug caught via full_strategy_backtest.py: the floor was previously
+    # only applied within the correlation branch, so currency-exposure
+    # scaling alone could push the combined result well below 0.25 - down
+    # to 0.049 observed in a real backtest run - contradicting this
+    # function's own stated intent above.)
+    scale = max(scale, CORR_SIZE_FLOOR)
+
+    return scale, "; ".join(reasons)
+
+
 def net_currency_exposure(active: list[tuple[str, int]]) -> dict[str, float]:
     """
     Net exposure per currency across every setup flagged THIS run, not just
@@ -1154,6 +1324,27 @@ def check_all(dry: bool = False) -> int:
     active_setups: list[tuple[str, int]] = []   # Layer 7: (name, side) for every live stack this run
     daily_closes: dict[str, pd.Series] = {}      # Layer 7: 1d closes, for the correlation check
 
+    # ---- Real, compounding account balance (opt-in via STARTING_BALANCE) --
+    # Seeded once, then updated as each trade closes (see the outcome-
+    # logging block below) - this becomes the equity Kelly sizing uses,
+    # so risk actually compounds with real results instead of sizing off
+    # a static number forever.
+    if "_account_balance" not in state and STARTING_BALANCE is not None:
+        state["_account_balance"] = STARTING_BALANCE
+        print(f"\n  --- Account tracking activated: starting balance "
+              f"{STARTING_BALANCE:.2f} {ACCOUNT_CURRENCY} ---")
+    stored_balance = state.get("_account_balance")
+    if stored_balance is not None and stored_balance <= 0:
+        print(f"\n  !! Tracked account balance is {stored_balance:.2f} {ACCOUNT_CURRENCY} (wiped out) "
+              f"- falling back to the static ACCOUNT_EQUITY default for sizing until this is "
+              f"manually reset. Real P&L tracking has stopped, not silently continued negative.")
+        current_equity = ACCOUNT_EQUITY
+    else:
+        current_equity = stored_balance if stored_balance is not None else ACCOUNT_EQUITY
+    rates_1d = None   # set when tf=="1d" below; used for lot-size conversion
+                       # and real P&L - explicit variable rather than relying
+                       # on "1d" happening to be last in TIMEFRAMES
+
     # ---- COT refresh (weekly data - cache it, don't hit it every run) ----
     cot_cache = state.setdefault("_cot_cache", {})
     last_cot = state.get("_cot_last_fetch")
@@ -1213,6 +1404,9 @@ def check_all(dry: bool = False) -> int:
     for tf in TIMEFRAMES:
         data = fetch_batch(list(WATCHLIST.values()), tf)
         print(f"\n  --- {tf} ({len(data)}/{len(WATCHLIST)} fetched) ---")
+        if tf == "1d":
+            rates_1d = live_conversion_rates(data)
+        rates = rates_1d
 
         for name, ticker in WATCHLIST.items():
             df = data.get(ticker)
@@ -1284,16 +1478,28 @@ def check_all(dry: bool = False) -> int:
 
             # Layer 7 tracking: every live stack this run feeds the portfolio
             # exposure/correlation check that runs once, after the tf loop.
+            if tf == "1d":
+                daily_closes[name] = df["Close"]
+
             kelly = None
             plan = None
+            lots = None
             if stack_label:
                 active_setups.append((name, stack_side))
                 tk = f"{stack_tier}|{OUTCOME_HORIZONS[0]}d"
                 stop_pct = (ATR_STOP_MULT * atr_v / price) if not np.isnan(atr_v) and price else None
-                kelly = kelly_size(state.get("_tally", {}).get(tk), stop_pct=stop_pct)
+                kelly = kelly_size(state.get("_tally", {}).get(tk), equity=current_equity, stop_pct=stop_pct)
+                corr_scale, corr_reason = open_position_risk_scale(
+                    name, stack_side, state.get("_pending", []), daily_closes)
+                if corr_scale < 1.0:
+                    kelly["risk_pct"] *= corr_scale
+                    kelly["risk_amount"] = round(kelly["risk_amount"] * corr_scale, 2)
+                    if kelly["notional"]:
+                        kelly["notional"] = round(kelly["notional"] * corr_scale, 2)
+                    kelly["basis"] += f" · scaled {corr_scale:.2f}x for overlap ({corr_reason})"
                 plan = entry_plan(price, atr_v, stack_side)
-            if tf == "1d":
-                daily_closes[name] = df["Close"]
+                if kelly["notional"] and rates:
+                    lots = notional_to_lots(name, price, kelly["notional"], rates)
 
             # One-line verdict up top - direction, tier, quality, size - so
             # the decision-relevant bit is visible even in a truncated phone
@@ -1301,9 +1507,13 @@ def check_all(dry: bool = False) -> int:
             verdict = ("" if not stack_label else
                        f"🎯 <b>{'LONG' if stack_side > 0 else 'SHORT'}</b> · "
                        f"Quality {qscore}/5 <i>({qbreak})</i>"
-                       + (f" · risk {kelly['risk_pct']*100:.2f}% (${kelly['risk_amount']:,.0f})"
+                       + (f" · risk {kelly['risk_pct']*100:.2f}% "
+                          f"({kelly['risk_amount']:,.0f} {ACCOUNT_CURRENCY})"
                           if kelly else "")
                        + "\n"
+                       + (f"📐 <b>Suggested size: {lots:.2f} lots</b> <i>(from the risk amount above, "
+                          f"at today's price and conversion rate - round down to your broker's "
+                          f"minimum increment)</i>\n" if lots else "")
                        + (f"Stop {plan['stop']:,.4f} (-{plan['stop_dist_pct']:.1f}%) · "
                           f"Target {plan['target']:,.4f} (+{plan['target_dist_pct']:.1f}%)\n"
                           if plan else "")
@@ -1370,6 +1580,7 @@ def check_all(dry: bool = False) -> int:
                     pend.append({"key": key, "pair": name, "ticker": ticker, "tf": tf,
                                  "cond": stack_tier, "side": stack_side,
                                  "price": price, "h": hz, "created": now.isoformat(),
+                                 "lots": lots,
                                  "due": (now + timedelta(days=int(hz*1.45))).isoformat()})
 
             events = []
@@ -1450,7 +1661,18 @@ def check_all(dry: bool = False) -> int:
                         continue
                     active_setups.append((name, side))
                     tk = f"{sig_name}|{REVERSION_HORIZON_DAYS}d"
-                    kelly_r = kelly_size(state.get("_tally", {}).get(tk), stop_pct=stop_pct)
+                    kelly_r = kelly_size(state.get("_tally", {}).get(tk), equity=current_equity, stop_pct=stop_pct)
+                    corr_scale_r, corr_reason_r = open_position_risk_scale(
+                        name, side, state.get("_pending", []), daily_closes)
+                    if corr_scale_r < 1.0:
+                        kelly_r["risk_pct"] *= corr_scale_r
+                        kelly_r["risk_amount"] = round(kelly_r["risk_amount"] * corr_scale_r, 2)
+                        if kelly_r["notional"]:
+                            kelly_r["notional"] = round(kelly_r["notional"] * corr_scale_r, 2)
+                        kelly_r["basis"] += f" · scaled {corr_scale_r:.2f}x for overlap ({corr_reason_r})"
+                    lots_r = None
+                    if kelly_r["notional"] and rates:
+                        lots_r = notional_to_lots(name, price, kelly_r["notional"], rates)
                     dirword = "LONG" if side > 0 else "SHORT"
                     pf_note = "1.15" if sig_name == "zscore_rev" else "1.14"
                     exit_pf_note = "0.99" if sig_name == "zscore_rev" else "1.03"
@@ -1459,9 +1681,11 @@ def check_all(dry: bool = False) -> int:
                     rmsg = (f"{icon} <b>{name}</b> · 1d · {label}\n"
                             f"{dirword} · {price:,.4f}\n"
                             f"🎯 <b>{dirword}</b> · risk {kelly_r['risk_pct']*100:.2f}% "
-                            f"(${kelly_r['risk_amount']:,.0f}"
-                            + (f", notional ${kelly_r['notional']:,.0f}" if kelly_r['notional'] else "")
+                            f"({kelly_r['risk_amount']:,.0f} {ACCOUNT_CURRENCY}"
+                            + (f", notional {kelly_r['notional']:,.0f} {ACCOUNT_CURRENCY}" if kelly_r['notional'] else "")
                             + f") · <i>{kelly_r['basis']}</i>\n"
+                            + (f"📐 <b>Suggested size: {lots_r:.2f} lots</b> <i>(round down to your "
+                               f"broker's minimum increment)</i>\n" if lots_r else "")
                             + (f"Stop {plan_r['stop']:,.4f} (-{plan_r['stop_dist_pct']:.1f}%) · "
                                f"Target {plan_r['target']:,.4f} (+{plan_r['target_dist_pct']:.1f}%)\n"
                                if plan_r else "")
@@ -1499,6 +1723,7 @@ def check_all(dry: bool = False) -> int:
                             pend.append({"key": pkey, "pair": name, "ticker": ticker, "tf": tf,
                                          "cond": sig_name, "side": side, "price": price,
                                          "h": REVERSION_HORIZON_DAYS, "created": now.isoformat(),
+                                         "lots": lots_r,
                                          "due": (now + timedelta(days=int(REVERSION_HORIZON_DAYS*1.45))).isoformat()})
 
             if not events:
@@ -1588,6 +1813,28 @@ def check_all(dry: bool = False) -> int:
             side = rec.get("side", 1)
             exit_price = float(d2["Close"].iloc[-2])
             ret = (exit_price / rec["price"] - 1) * 100 * side
+
+            # Real account balance update - only for records that HAVE a
+            # stored lot size (i.e. created after this feature went live;
+            # older in-flight trades from before this update predate real
+            # lot tracking and are correctly left out of the real-money
+            # tally, not guessed at).
+            real_pnl = None
+            if rec.get("lots") and STARTING_BALANCE is not None and "_account_balance" in state and rates_1d:
+                legs = currency_legs(rec["pair"])
+                if legs and rates_1d.get("usd_to_account") and legs[1] in rates_1d["to_usd"]:
+                    units = rec["lots"] * CONTRACT_SIZE.get(rec["pair"], 0)
+                    move = (exit_price - rec["price"]) * side
+                    pnl_quote = units * move
+                    real_pnl = pnl_quote * rates_1d["to_usd"][legs[1]] * rates_1d["usd_to_account"]
+                    state["_account_balance"] = state["_account_balance"] + real_pnl
+                    print(f"  ACCOUNT: {rec['pair']} {rec['cond']} closed {real_pnl:+.2f} "
+                          f"{ACCOUNT_CURRENCY} -> balance now {state['_account_balance']:.2f} {ACCOUNT_CURRENCY}")
+                    if state["_account_balance"] <= 0:
+                        print(f"  !! ACCOUNT BALANCE HAS REACHED ZERO OR BELOW. Real position "
+                              f"sizing will fall back to the static default until this is reset "
+                              f"- check real trading results before continuing to size off this.")
+
             k = f"{rec['cond']}|{rec['h']}d"
             t = tally.setdefault(k, {"n": 0, "sum": 0.0, "wins": 0,
                                      "long_n": 0, "long_w": 0, "short_n": 0, "short_w": 0,
