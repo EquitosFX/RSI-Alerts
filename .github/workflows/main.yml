@@ -43,8 +43,23 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           # Optional - defaults to $10,000 if not set. Set this secret (or
           # switch to a repo Variable if you'd rather it not be a secret)
-          # so Kelly position sizing reflects your real account size.
+          # so Kelly position sizing reflects your real account size. Once
+          # STARTING_BALANCE below is set, this becomes a one-time fallback
+          # only - real tracked P&L takes over as the sizing equity instead.
           ACCOUNT_EQUITY: ${{ secrets.ACCOUNT_EQUITY }}
+          # Optional - activates REAL, compounding account tracking. Once
+          # set, the bot seeds a real balance from this value on its first
+          # run, then updates it with the actual £/$ P&L of every trade that
+          # closes from that point forward (using the real lot size shown
+          # in each alert) - so position sizing compounds with genuine
+          # results instead of sizing off a static number forever. Leave
+          # unset to keep the previous, non-compounding behavior exactly as
+          # it was. Does NOT retroactively track trades already in flight
+          # before this is set.
+          STARTING_BALANCE: ${{ secrets.STARTING_BALANCE }}
+          # Optional - the currency STARTING_BALANCE (and all real P&L
+          # tracking) is denominated in. Defaults to GBP if not set.
+          ACCOUNT_CURRENCY: ${{ secrets.ACCOUNT_CURRENCY }}
           # Optional - the bot works without it (falls back to a hardcoded
           # first-Friday-of-the-month approximation for the NFP guardrail).
           # Free key: https://fred.stlouisfed.org/docs/api/api_key.html
