@@ -126,7 +126,14 @@ ATR_TARGET_MULT       = 3.0     # target distance for the entry-plan line, in AT
                                  # as a sizing/planning convenience, not a validated exit signal.
 KELLY_FRACTION        = 0.5     # half-Kelly - full Kelly is well-documented as too aggressive
                                  # given real-world estimation error on a live sample
-MAX_RISK_PCT          = 0.02    # hard cap regardless of what Kelly says
+MAX_RISK_PCT          = 0.005   # hard cap regardless of what Kelly says - lowered
+                                  # from 0.02 after backtesting showed the 2% cap
+                                  # let sizing scale up right into the March-May
+                                  # 2022 volatility spike (Fed hiking cycle +
+                                  # Ukraine invasion shock), turning a bad ~10-week
+                                  # stretch into a 95% drawdown. 0.5% avoided that
+                                  # near-wipeout entirely with comparable or better
+                                  # returns in every window tested (1/2/5yr).
 MIN_TRADES_FOR_KELLY  = 50      # below this the tally is noise, not edge - see kelly_from_tally()
 DEFAULT_RISK_PCT      = 0.005   # fixed, conservative fallback while the sample builds
 
