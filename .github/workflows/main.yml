@@ -64,6 +64,12 @@ jobs:
           # first-Friday-of-the-month approximation for the NFP guardrail).
           # Free key: https://fred.stlouisfed.org/docs/api/api_key.html
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          # Optional - activates the market news digest (free tier: 25
+          # requests/day, plenty for the default 4-hourly check). Get a
+          # free key at https://www.alphavantage.co/support/#api-key
+          # Leave unset to keep this feature off entirely - nothing else
+          # in the bot depends on it.
+          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
         run: python rsi_alerts.py ${{ inputs.test_message && '--test-message' || (inputs.dry_run && '--dry-run' || '') }}
 
       - name: Save alert state
