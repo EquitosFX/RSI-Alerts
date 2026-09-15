@@ -255,6 +255,20 @@ NEWS_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"]
 NEWS_COMMODITY_KEYWORDS = {"GOLD": ["gold", "xau"], "SILVER": ["silver", "xag"]}
 NEWS_RELEVANCE_MIN = 0.15
 NEWS_SENTIMENT_MIN = 0.15         # "Somewhat-Bullish/Bearish" or stronger only
+
+# ---- Economic calendar digest (free, no key required) ---------------------
+# Complements the reactive, sentiment-scored news digest above with a
+# forward-looking one: scheduled events the market already knows are coming,
+# pre-rated High/Medium/Low by importance rather than inferred from tone.
+# Unofficial weekly JSON export used by countless MT4/5 EAs for this exact
+# purpose (see e.g. mql5.com/en/forum/343908) - not affiliated with
+# ForexFactory/Fair Economy, and the URL/format could change without
+# notice, so this fails gracefully to "skip this run" on any error, same
+# as every other optional source here.
+ECONOMIC_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+CALENDAR_DIGEST_EVERY_HOURS = 12   # the source itself only refreshes ~weekly
+CALENDAR_LOOKAHEAD_HOURS = 24
+CALENDAR_MIN_IMPACT = "Medium"      # High or Medium only, Low skipped
 NFP_WINDOW_DAYS = 2    # matches the tested window exactly - not re-tuned here
 NFP_CACHE_DAYS  = 14   # NFP dates are announced months ahead and don't change -
                         # no need to refetch often
@@ -1439,6 +1453,82 @@ def summarize_commodity_news(feed: list, keywords=NEWS_COMMODITY_KEYWORDS,
     return best
 
 
+def group_news_hits_by_article(hits: list[tuple[str, dict]]) -> list[dict]:
+    """
+    A single broad story (e.g. "Dollar towers as traders brace for hawkish
+    Fed") legitimately scores highest for USD AND most of its counter-
+    currencies at once - confirmed in a live run where one article filled
+    6 of the digest's slots with the same headline repeated once per
+    currency. This groups hits that share the same source article into one
+    entry listing every relevant instrument, so the digest surfaces that
+    many DIFFERENT stories instead of one story six times.
+    """
+    groups: dict[str, dict] = {}
+    for name, info in hits:
+        key = info.get("url") or info["title"]
+        g = groups.setdefault(key, {"names": [], "title": info["title"],
+                                     "sent": info["sent"], "label": info["label"],
+                                     "score": info["score"]})
+        g["names"].append(name)
+        g["score"] = max(g["score"], info["score"])
+    return sorted(groups.values(), key=lambda g: -g["score"])
+
+
+def fetch_economic_calendar() -> list | None:
+    """
+    Free, no-key weekly economic calendar export - returns None (never
+    raises) on any failure, so a URL/format change upstream just means no
+    calendar digest that run, never a bot crash.
+    """
+    try:
+        r = requests.get(ECONOMIC_CALENDAR_URL, timeout=20)
+        if r.status_code != 200:
+            print(f"  !! Economic calendar: HTTP {r.status_code}")
+            return None
+        return r.json()
+    except Exception as e:
+        print(f"  !! Economic calendar fetch failed: {e}")
+        return None
+
+
+def upcoming_high_impact_events(calendar: list, within_hours: float = CALENDAR_LOOKAHEAD_HOURS,
+                                 min_impact: str = CALENDAR_MIN_IMPACT,
+                                 currencies=NEWS_CURRENCIES, now=None) -> list:
+    """
+    Filters the raw calendar to High/Medium-impact events in the watched
+    currencies (plus "All"-country events like G20 summits), due within
+    the next `within_hours`. Purely informational - never gates a trade,
+    same as everything else in this section. Malformed individual rows
+    are skipped rather than crashing the whole digest.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    impact_rank = {"Low": 0, "Medium": 1, "High": 2}
+    min_rank = impact_rank.get(min_impact, 1)
+    cutoff = now + timedelta(hours=within_hours)
+    watched = set(currencies)
+    out = []
+    for e in calendar or []:
+        try:
+            impact = e.get("impact", "Low")
+            if impact_rank.get(impact, 0) < min_rank:
+                continue
+            country = e.get("country", "")
+            if country not in watched and country != "All":
+                continue
+            dt = datetime.fromisoformat(e["date"])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            dt_utc = dt.astimezone(timezone.utc)
+            if now <= dt_utc <= cutoff:
+                out.append({"title": e.get("title", ""), "country": country,
+                            "impact": impact, "time_utc": dt_utc,
+                            "forecast": e.get("forecast", ""), "previous": e.get("previous", "")})
+        except Exception:
+            continue
+    return sorted(out, key=lambda x: x["time_utc"])
+
+
 def check_all(dry: bool = False) -> int:
     state = load_state()
     sent = 0
@@ -2080,14 +2170,15 @@ def check_all(dry: bool = False) -> int:
                 all_hits = [(k, v) for k, v in ccy_hits.items()] + \
                            [(k, v) for k, v in metal_hits.items()]
                 if all_hits:
-                    all_hits.sort(key=lambda x: -x[1]["score"])
+                    grouped = group_news_hits_by_article(all_hits)
                     lines = ["📰 <b>Market news digest</b>",
                              "<i>Context only - not a trade signal, nothing here changes "
                              "sizing or gates a trade</i>", ""]
-                    for name, info in all_hits[:8]:
-                        arrow = "🟢" if info["sent"] > 0 else "🔴"
-                        title_safe = html.escape(info["title"])
-                        lines.append(f"{arrow} <b>{name}</b> ({info['label']}): {title_safe}")
+                    for g in grouped[:8]:
+                        arrow = "🟢" if g["sent"] > 0 else "🔴"
+                        names_str = ", ".join(g["names"])
+                        title_safe = html.escape(g["title"])
+                        lines.append(f"{arrow} <b>{names_str}</b> ({g['label']}): {title_safe}")
                     lines.append("")
                     lines.append("<i>Source: Alpha Vantage aggregated retail news - not "
                                   "institutional low-latency feeds, so treat timing as "
@@ -2102,6 +2193,43 @@ def check_all(dry: bool = False) -> int:
             # skip silently: _last_news_digest is NOT updated, so this is
             # retried next run rather than waiting the full window after a
             # transient failure.
+
+    # ---- Economic calendar digest (free, no key required) -----------------
+    if CALENDAR_DIGEST_EVERY_HOURS > 0:
+        last_cal = state.get("_last_calendar_digest")
+        due = True
+        if last_cal:
+            try:
+                due = now - datetime.fromisoformat(last_cal) >= timedelta(hours=CALENDAR_DIGEST_EVERY_HOURS)
+            except Exception:
+                due = True
+        if due:
+            calendar = fetch_economic_calendar()
+            if calendar is not None:
+                state["_last_calendar_digest"] = now.isoformat()
+                events = upcoming_high_impact_events(calendar, now=now)
+                if events:
+                    lines = ["🗓️ <b>Upcoming high-impact events</b>",
+                             f"<i>Next {CALENDAR_LOOKAHEAD_HOURS}h, {CALENDAR_MIN_IMPACT}+ impact - "
+                             "context only, not a trade signal</i>", ""]
+                    for e in events[:10]:
+                        icon = "🔴" if e["impact"] == "High" else "🟠"
+                        title_safe = html.escape(e["title"])
+                        fc = f" (forecast {html.escape(e['forecast'])}, prev {html.escape(e['previous'])})" \
+                             if e["forecast"] or e["previous"] else ""
+                        lines.append(f"{icon} {e['time_utc'].strftime('%a %H:%M UTC')} · "
+                                     f"<b>{e['country']}</b> {title_safe}{fc}")
+                    lines.append("")
+                    lines.append("<i>Source: unofficial weekly ForexFactory-derived calendar "
+                                  "export - not affiliated with ForexFactory, format/URL could "
+                                  "change without notice.</i>")
+                    if send_telegram("\n".join(lines), dry):
+                        sent += 1
+                        print(f"  CALENDAR DIGEST sent ({len(events)} events)")
+                else:
+                    print("  Calendar digest: fetched OK, nothing high-impact in the window")
+            # calendar is None: fetch failed - skip silently, not updating
+            # the timestamp so it's retried next run.
 
     # ---- Periodic forward-test report ------------------------------------
     if LOG_OUTCOMES:
