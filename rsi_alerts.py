@@ -22,7 +22,7 @@ SETUP: see README notes - Telegram bot via @BotFather, secrets in GitHub.
 Test delivery any time with:  python3 rsi_alerts.py --test-message
 """
 
-import json, os, sys, time, argparse
+import json, os, sys, time, argparse, html
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
@@ -235,6 +235,26 @@ COT_CACHE_DAYS = 3   # the underlying data only updates weekly - no reason
 # off the first Friday only rarely (holiday collisions), so the fallback
 # is a deliberate approximation, not a guess pulled from nowhere.
 FRED_API_KEY   = os.environ.get("FRED_API_KEY", "")
+
+# ---- News sentiment digest (opt-in via ALPHAVANTAGE_API_KEY) --------------
+# Free, low-cost alternative to paid "market bias" news terminals - pulls
+# live news + sentiment from Alpha Vantage's free tier (25 requests/day)
+# and surfaces the highest-relevance, most-directional headlines per
+# currency, exactly the "which instruments does this move, and how much"
+# read those terminals charge for. Context only - never gates a trade or
+# affects sizing, same as every other informational feature in this bot.
+ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY", "")
+NEWS_DIGEST_EVERY_HOURS = 4      # 0 = off. 4h -> 6 calls/day, well inside
+                                   # the free tier's 25/day cap.
+NEWS_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"]
+# Alpha Vantage has no dedicated spot-metal ticker - "GOLD" resolves to a
+# mining EQUITY, confirmed by testing - so gold/silver use a keyword match
+# on title/summary instead, falling back to the article's overall sentiment
+# rather than a (nonexistent) ticker-specific one. Flagged in the digest
+# itself as less precise than the currency rows.
+NEWS_COMMODITY_KEYWORDS = {"GOLD": ["gold", "xau"], "SILVER": ["silver", "xag"]}
+NEWS_RELEVANCE_MIN = 0.15
+NEWS_SENTIMENT_MIN = 0.15         # "Somewhat-Bullish/Bearish" or stronger only
 NFP_WINDOW_DAYS = 2    # matches the tested window exactly - not re-tuned here
 NFP_CACHE_DAYS  = 14   # NFP dates are announced months ahead and don't change -
                         # no need to refetch often
@@ -1322,6 +1342,103 @@ def is_near_nfp(check_date, nfp_cache: dict) -> bool:
     return False
 
 
+def fetch_news_sentiment(tickers: str | None = None, limit: int = 50) -> list | None:
+    """
+    Pulls live news + sentiment from Alpha Vantage's free NEWS_SENTIMENT
+    endpoint. Returns None - never raises - if no key is configured, the
+    request fails, or Alpha Vantage's own rate-limit message comes back
+    (which arrives as a 200 with a "Note"/"Information" field instead of
+    a "feed", not an HTTP error). This is supplementary context only: any
+    None here just means no digest this run, never a bot failure.
+    """
+    if not ALPHAVANTAGE_API_KEY:
+        return None
+    params = {"function": "NEWS_SENTIMENT", "apikey": ALPHAVANTAGE_API_KEY,
+              "limit": limit, "sort": "LATEST"}
+    if tickers:
+        params["tickers"] = tickers
+    try:
+        r = requests.get("https://www.alphavantage.co/query", params=params, timeout=20)
+        if r.status_code != 200:
+            print(f"  !! News digest: HTTP {r.status_code}")
+            return None
+        data = r.json()
+        if "Note" in data or "Information" in data:
+            print(f"  !! News digest: {data.get('Note') or data.get('Information')}")
+            return None
+        return data.get("feed", [])
+    except Exception as e:
+        print(f"  !! News digest fetch failed: {e}")
+        return None
+
+
+def summarize_currency_news(feed: list, currencies=NEWS_CURRENCIES,
+                             relevance_min: float = NEWS_RELEVANCE_MIN,
+                             sentiment_min: float = NEWS_SENTIMENT_MIN) -> dict:
+    """
+    For each watched currency, finds the single highest relevance x
+    |sentiment| headline in the feed - the "which instruments does this
+    move, and how much" read paid news terminals charge for, built from
+    the same per-ticker fields Alpha Vantage already returns.
+    """
+    best: dict = {}
+    for article in feed or []:
+        title = article.get("title", "")
+        url = article.get("url", "")
+        for ts in article.get("ticker_sentiment", []):
+            ticker = ts.get("ticker", "")
+            if not ticker.startswith("FOREX:"):
+                continue
+            ccy = ticker.split(":", 1)[1]
+            if ccy not in currencies:
+                continue
+            try:
+                rel = float(ts.get("relevance_score", 0))
+                sent = float(ts.get("ticker_sentiment_score", 0))
+            except (TypeError, ValueError):
+                continue
+            if rel < relevance_min or abs(sent) < sentiment_min:
+                continue
+            score = rel * abs(sent)
+            prev = best.get(ccy)
+            if prev is None or score > prev["score"]:
+                best[ccy] = {"title": title, "url": url, "sent": sent, "score": score,
+                             "label": ts.get("ticker_sentiment_label", "")}
+    return best
+
+
+def summarize_commodity_news(feed: list, keywords=NEWS_COMMODITY_KEYWORDS,
+                              sentiment_min: float = NEWS_SENTIMENT_MIN) -> dict:
+    """
+    Gold/silver fallback: Alpha Vantage has no dedicated spot-metal ticker
+    (confirmed by testing - "GOLD" resolves to a mining EQUITY, not the
+    metal), so this matches keywords in title/summary instead and uses the
+    article's OVERALL sentiment rather than a ticker-specific one. Less
+    precise than summarize_currency_news() above - flagged as such in the
+    digest message itself, not silently presented as equally reliable.
+    """
+    best: dict = {}
+    for article in feed or []:
+        title = article.get("title", "")
+        summary = article.get("summary", "")
+        text = f"{title} {summary}".lower()
+        try:
+            sent = float(article.get("overall_sentiment_score", 0))
+        except (TypeError, ValueError):
+            continue
+        if abs(sent) < sentiment_min:
+            continue
+        for metal, kws in keywords.items():
+            if any(kw in text for kw in kws):
+                score = abs(sent)
+                prev = best.get(metal)
+                if prev is None or score > prev["score"]:
+                    best[metal] = {"title": title, "url": article.get("url", ""),
+                                   "sent": sent, "score": score,
+                                   "label": article.get("overall_sentiment_label", "")}
+    return best
+
+
 def check_all(dry: bool = False) -> int:
     state = load_state()
     sent = 0
@@ -1941,6 +2058,50 @@ def check_all(dry: bool = False) -> int:
                 state["_last_digest"] = now.isoformat()
                 print(f"\n  DIGEST sent ({len(ob)} overbought, {len(os_)} oversold, "
                       f"{len(exp_warn)} exposure warn, {len(corr_warn)} corr warn)")
+
+    # ---- News sentiment digest (opt-in via ALPHAVANTAGE_API_KEY) ----------
+    if NEWS_DIGEST_EVERY_HOURS > 0 and ALPHAVANTAGE_API_KEY:
+        last_news = state.get("_last_news_digest")
+        due = True
+        if last_news:
+            try:
+                due = now - datetime.fromisoformat(last_news) >= timedelta(hours=NEWS_DIGEST_EVERY_HOURS)
+            except Exception:
+                due = True
+        if due:
+            tickers_param = ",".join(f"FOREX:{c}" for c in NEWS_CURRENCIES)
+            feed = fetch_news_sentiment(tickers=tickers_param, limit=50)
+            if feed is not None:
+                # Fetch itself succeeded - don't retry until the next window
+                # regardless of whether anything cleared the threshold below.
+                state["_last_news_digest"] = now.isoformat()
+                ccy_hits = summarize_currency_news(feed)
+                metal_hits = summarize_commodity_news(feed)
+                all_hits = [(k, v) for k, v in ccy_hits.items()] + \
+                           [(k, v) for k, v in metal_hits.items()]
+                if all_hits:
+                    all_hits.sort(key=lambda x: -x[1]["score"])
+                    lines = ["📰 <b>Market news digest</b>",
+                             "<i>Context only - not a trade signal, nothing here changes "
+                             "sizing or gates a trade</i>", ""]
+                    for name, info in all_hits[:8]:
+                        arrow = "🟢" if info["sent"] > 0 else "🔴"
+                        title_safe = html.escape(info["title"])
+                        lines.append(f"{arrow} <b>{name}</b> ({info['label']}): {title_safe}")
+                    lines.append("")
+                    lines.append("<i>Source: Alpha Vantage aggregated retail news - not "
+                                  "institutional low-latency feeds, so treat timing as "
+                                  "approximate. Gold/silver matched by keyword, not a "
+                                  "dedicated ticker - less precise than the currency rows.</i>")
+                    if send_telegram("\n".join(lines), dry):
+                        sent += 1
+                        print(f"  NEWS DIGEST sent ({len(all_hits)} items above threshold)")
+                else:
+                    print("  News digest: fetched OK, nothing above threshold this run")
+            # feed is None (not configured, request failed, or rate-limited):
+            # skip silently: _last_news_digest is NOT updated, so this is
+            # retried next run rather than waiting the full window after a
+            # transient failure.
 
     # ---- Periodic forward-test report ------------------------------------
     if LOG_OUTCOMES:
